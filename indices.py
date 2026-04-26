@@ -1,6 +1,7 @@
 import torch
 import numpy as np
-from scipy.sparse import csr_matrix, diags
+from scipy.sparse.linalg import spsolve
+from scipy.sparse import csr_matrix, eye, diags
 from torch_geometric.utils import to_undirected
 
 
@@ -28,6 +29,38 @@ def jaccard_scores(data, edge_label_index=None):
     with np.errstate(divide='ignore', invalid='ignore'):
         scores = inter / union
         scores[union == 0] = 0.0
+
+    return torch.tensor(scores, dtype=torch.float)
+
+def katz_scores(data, beta=0.1, edge_label_index=None):
+    edge_index = data.edge_index
+    num_nodes = data.num_nodes
+    if edge_label_index is None:
+        edge_label_index = data.edge_label_index
+
+    edge_index_und = to_undirected(edge_index, num_nodes=num_nodes)
+    edge_index_und = torch.unique(edge_index_und, dim=1)
+
+    row, col = edge_index_und.cpu().numpy()
+    data_vals = np.ones(len(row), dtype=np.float64)
+    A = csr_matrix((data_vals, (row, col)), shape=(num_nodes, num_nodes))
+
+    M = eye(num_nodes, dtype=np.float64, format='csr') - beta * A
+
+    u = edge_label_index[0].cpu().numpy()
+    v = edge_label_index[1].cpu().numpy()
+
+    unique_v, inv_map = np.unique(v, return_inverse=True)
+
+    E = np.zeros((num_nodes, len(unique_v)), dtype=np.float64)
+    E[unique_v, np.arange(len(unique_v))] = 1.0
+
+    E_csr = csr_matrix(E)
+    X = spsolve(M, E_csr)
+
+    katz_values = X[u, inv_map]
+
+    scores = 1.0 / (1.0 + np.exp(-katz_values))
 
     return torch.tensor(scores, dtype=torch.float)
 
