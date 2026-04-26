@@ -4,7 +4,7 @@ import pandas as pd
 from torch_geometric.data import Data
 from torch_geometric.transforms import RandomLinkSplit
 from torch_geometric.loader import LinkNeighborLoader
-from torch_geometric.utils import degree
+from torch_geometric.utils import degree, remove_self_loops
 from chartalist.common.bitcoin_graph_maker import BitcoinGraphMaker
 
 
@@ -18,10 +18,27 @@ def load_raw_data(in_path, out_path):
     df_out = pd.DataFrame({'trans': lines_out})
     return df_in, df_out
 
-def build_networkx_graph(df_in, df_out):
+
+def collapse_transaction_vertices(G):
+    tx_nodes = [node for node, attr in G.nodes(data=True) if attr.get('type') == 'trans']
+    for tx in tx_nodes:
+        in_edges = list(G.in_edges(tx))   # (address, tx)
+        out_edges = list(G.out_edges(tx)) # (tx, address)
+        for u, _ in in_edges:
+            for _, v in out_edges:
+                if not G.has_edge(u, v):
+                    G.add_edge(u, v, value=1.0)
+        G.remove_node(tx)
+    return G
+
+
+def build_networkx_graph(df_in, df_out, collapse=False):
     bgm = BitcoinGraphMaker()
     G_nx = bgm.make_graph(df_in, df_out)
+    if collapse:
+        G_nx = collapse_transaction_vertices(G_nx)
     return G_nx
+
 
 def convert_to_pyg_data(G_nx):
     nodes = list(G_nx.nodes())
@@ -30,12 +47,13 @@ def convert_to_pyg_data(G_nx):
     edges = list(G_nx.edges(data='value'))
     src = [addr2idx[u] for u, v, w in edges]
     dst = [addr2idx[v] for u, v, w in edges]
-    weights = [w for u, v, w in edges]
+    weights = [w if w is not None else 0.0 for u, v, w in edges]
 
     edge_index = torch.tensor([src, dst], dtype=torch.long)
     edge_attr = torch.tensor(weights, dtype=torch.float32).unsqueeze(1)
     data = Data(edge_index=edge_index, edge_attr=edge_attr)
     return data
+
 
 def add_transaction_weights(G, df_in, df_out):
     for _, row in df_in.iterrows():
@@ -64,6 +82,7 @@ def add_transaction_weights(G, df_in, df_out):
 
     return G
 
+
 def add_node_features(data):
     num_nodes = data.num_nodes
     in_deg = degree(data.edge_index[1], num_nodes=num_nodes, dtype=torch.float32)
@@ -71,8 +90,10 @@ def add_node_features(data):
     data.x = torch.stack([in_deg, out_deg], dim=1)
     return data
 
+
 def save_data(data, path):
     torch.save(data, path)
+
 
 def prepare_link_prediction_loaders(data, num_neighbors=[10, 5], batch_size=1024,
                                     num_val=0.1, num_test=0.1, neg_sampling_ratio=1.0):
@@ -93,21 +114,29 @@ def prepare_link_prediction_loaders(data, num_neighbors=[10, 5], batch_size=1024
     )
     return train_loader, val_data, test_data
 
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Построение графа транзакций Bitcoin и подготовка данных для link prediction")
     parser.add_argument("in_file", help="Путь к объединённому CSV-файлу входов")
     parser.add_argument("out_file", help="Путь к объединённому CSV-файлу выходов")
-    parser.add_argument("--save", default="bitcoin_split.pt", help="Имя файла для сохранения объекта Data (по умолчанию bitcoin_split.pt)")
+    parser.add_argument("--save", default="bitcoin_split.pt", help="Имя файла для сохранения объекта Data")
+    parser.add_argument("--collapse-transactions", action="store_true",
+                        help="Построить граф адрес-адрес, удалив транзакционные вершины (вес ребра = 1)")
+    parser.add_argument("--remove-self-loops", action="store_true",
+                        help="Удалить петли")
     args = parser.parse_args()
 
     df_in, df_out = load_raw_data(args.in_file, args.out_file)
-    G_nx = build_networkx_graph(df_in, df_out)
-    G_nx = add_transaction_weights(G_nx, df_in, df_out)
+    G_nx = build_networkx_graph(df_in, df_out, collapse=args.collapse_transactions)
+
+    if not args.collapse_transactions:
+        G_nx = add_transaction_weights(G_nx, df_in, df_out)
+
     data = convert_to_pyg_data(G_nx)
     data = add_node_features(data)
+    data.edge_index, data.edge_attr = remove_self_loops(data.edge_index, data.edge_attr)
     save_data(data, args.save)
 
-    train_loader, val_data, test_data = prepare_link_prediction_loaders(data)
+    # train_loader, val_data, test_data = prepare_link_prediction_loaders(data)
 
     print(f"Граф загружен: {data.num_nodes} вершин, {data.num_edges} рёбер")
-
