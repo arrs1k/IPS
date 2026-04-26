@@ -8,33 +8,23 @@ import numpy as np
 
 
 class EthereumLinkPredictor(nn.Module):
-    """
-    GNN модель для предсказания ссылок на графе Ethereum транзакций
-    """
-
     def __init__(self, in_channels, hidden_channels=128, out_channels=64, num_layers=2, dropout=0.3):
         super().__init__()
 
         self.convs = nn.ModuleList()
-        self.bns = nn.ModuleList()  # batch normalization
+        self.bns = nn.ModuleList() 
 
-        # Входной слой
         self.convs.append(SAGEConv(in_channels, hidden_channels))
         self.bns.append(nn.BatchNorm1d(hidden_channels))
 
-        # Скрытые слои
         for i in range(num_layers - 1):
             self.convs.append(SAGEConv(hidden_channels, hidden_channels))
             self.bns.append(nn.BatchNorm1d(hidden_channels))
 
-        # Выходной слой для эмбеддингов
         self.lin = nn.Linear(hidden_channels, out_channels)
         self.dropout = dropout
 
     def encode(self, x, edge_index):
-        """
-        Кодирование узлов в эмбеддинги
-        """
         for i, conv in enumerate(self.convs):
             x = conv(x, edge_index)
             x = self.bns[i](x)
@@ -45,30 +35,14 @@ class EthereumLinkPredictor(nn.Module):
         return x
 
     def decode(self, z, edge_label_index):
-        """
-        Декодирование эмбеддингов в предсказания рёбер
-        """
         return (z[edge_label_index[0]] * z[edge_label_index[1]]).sum(dim=-1)
 
     def forward(self, x, edge_index, edge_label_index):
-        """
-        Полный forward pass
-        """
         z = self.encode(x, edge_index)
         return self.decode(z, edge_label_index)
 
 
 class EthereumLinkPredictionTrainer:
-    """
-    Трейнер для задачи link prediction на графе Ethereum транзакций
-
-    Параметры:
-        model: nn.Module с методом forward(x, edge_index, edge_label_index) -> Tensor
-        optimizer: torch.optim.Optimizer
-        criterion: функция потерь (например, BCEWithLogitsLoss)
-        device: torch.device
-        loader_kwargs: dict с параметрами для LinkNeighborLoader (batch_size, num_neighbors и т.д.)
-    """
 
     def __init__(self, model, optimizer, criterion, device=None, **loader_kwargs):
         self.model = model
@@ -80,16 +54,6 @@ class EthereumLinkPredictionTrainer:
         self.history = {'train_loss': [], 'val_loss': [], 'train_auc': [], 'val_auc': []}
 
     def fit(self, train_data, val_data=None, epochs=100, verbose=True, eval_metrics=True):
-        """
-        Обучение модели
-
-        Параметры:
-            train_data: данные для обучения (после RandomLinkSplit)
-            val_data: данные для валидации
-            epochs: количество эпох
-            verbose: печатать ли прогресс
-            eval_metrics: вычислять ли AUC метрики
-        """
         train_loader = LinkNeighborLoader(
             train_data,
             edge_label_index=train_data.edge_label_index,
@@ -99,7 +63,6 @@ class EthereumLinkPredictionTrainer:
         )
 
         for epoch in range(1, epochs + 1):
-            # Обучение
             self.model.train()
             total_loss = 0.0
             for batch in train_loader:
@@ -114,7 +77,6 @@ class EthereumLinkPredictionTrainer:
             avg_train_loss = total_loss / len(train_data)
             self.history['train_loss'].append(avg_train_loss)
 
-            # Валидация
             if val_data is not None:
                 val_loss = self.evaluate_loss(val_data)
                 self.history['val_loss'].append(val_loss)
@@ -136,9 +98,6 @@ class EthereumLinkPredictionTrainer:
         return self.history
 
     def evaluate_loss(self, data):
-        """
-        Вычисляет средний лосс на наборе данных (без градиентов)
-        """
         self.model.eval()
         with torch.no_grad():
             loader = LinkNeighborLoader(
@@ -157,9 +116,6 @@ class EthereumLinkPredictionTrainer:
         return total_loss / len(data)
 
     def evaluate_auc(self, data):
-        """
-        Вычисляет AUC-ROC для бинарной классификации рёбер
-        """
         self.model.eval()
         with torch.no_grad():
             loader = LinkNeighborLoader(
@@ -193,9 +149,6 @@ class EthereumLinkPredictionTrainer:
         return auc_roc
 
     def predict(self, data, edge_label_index=None):
-        """
-        Возвращает вероятности для заданных пар вершин
-        """
         if edge_label_index is None:
             edge_label_index = data.edge_label_index
 
@@ -207,7 +160,6 @@ class EthereumLinkPredictionTrainer:
         return probs.numpy().flatten()
 
     def save_model(self, path):
-        """Сохраняет модель и историю обучения"""
         torch.save({
             'model_state_dict': self.model.state_dict(),
             'optimizer_state_dict': self.optimizer.state_dict(),
@@ -216,7 +168,6 @@ class EthereumLinkPredictionTrainer:
         print(f"Модель сохранена в {path}")
 
     def load_model(self, path):
-        """Загружает модель"""
         checkpoint = torch.load(path, map_location=self.device)
         self.model.load_state_dict(checkpoint['model_state_dict'])
         self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])

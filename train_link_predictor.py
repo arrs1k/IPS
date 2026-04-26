@@ -15,7 +15,6 @@ def main():
     parser.add_argument("--dropout", type=float, default=0.3, help="Dropout rate")
     args = parser.parse_args()
 
-    # 1. Загрузка графа
     print("=" * 60)
     print("ЗАГРУЗКА ГРАФА")
     print("=" * 60)
@@ -25,7 +24,6 @@ def main():
     print(f"  - Рёбер: {data.num_edges:,}")
     print(f"  - Размерность признаков: {data.x.shape[1]}")
 
-    # 2. Разделение данных на train/val/test
     print("\n" + "=" * 60)
     print("РАЗДЕЛЕНИЕ ДАННЫХ")
     print("=" * 60)
@@ -40,14 +38,12 @@ def main():
     print(f"Val: {val_data.edge_label_index.shape[1]} пар рёбер")
     print(f"Test: {test_data.edge_label_index.shape[1]} пар рёбер")
 
-    # 3. Настройка устройства
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     train_data = train_data.to(device)
     val_data = val_data.to(device)
     test_data = test_data.to(device)
     print(f"\nУстройство: {device}")
 
-    # 4. Создание модели
     print("\n" + "=" * 60)
     print("СОЗДАНИЕ МОДЕЛИ")
     print("=" * 60)
@@ -64,12 +60,10 @@ def main():
     print(f"  - Dropout: {args.dropout}")
     print(f"  - Параметров: {sum(p.numel() for p in model.parameters()):,}")
 
-    # 5. Оптимизатор и функция потерь
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr, weight_decay=5e-4)
     criterion = torch.nn.BCEWithLogitsLoss()
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', patience=5, factor=0.5)
 
-    # 6. Создание трейнера
     trainer = EthereumLinkPredictionTrainer(
         model=model,
         optimizer=optimizer,
@@ -79,7 +73,6 @@ def main():
         batch_size=args.batch_size
     )
 
-    # 7. Обучение
     print("\n" + "=" * 60)
     print("НАЧАЛО ОБУЧЕНИЯ")
     print("=" * 60)
@@ -91,7 +84,6 @@ def main():
         eval_metrics=True
     )
 
-    # 8. Оценка на тестовых данных
     print("\n" + "=" * 60)
     print("ОЦЕНКА НА ТЕСТОВЫХ ДАННЫХ")
     print("=" * 60)
@@ -100,25 +92,14 @@ def main():
     print(f"Test Loss: {test_loss:.4f}")
     print(f"Test AUC: {test_auc:.4f}")
 
-    # 9. Сохранение модели
     trainer.save_model(args.save_model)
 
-    # 10. Вывод итогов
     print("\n" + "=" * 60)
     print("ОБУЧЕНИЕ ЗАВЕРШЕНО")
     print("=" * 60)
     print(f"Лучшая Val AUC: {max(history['val_auc'] if history['val_auc'] else [0]):.4f}")
     print(f"Лучшая Val Loss: {min(history['val_loss'] if history['val_loss'] else [0]):.4f}")
     print(f"Модель сохранена в {args.save_model}")
-
-    # 11. Пример предсказания
-    print("\n" + "=" * 60)
-    print("ПРИМЕР ПРЕДСКАЗАНИЯ")
-    print("=" * 60)
-    predictions = trainer.predict(test_data, test_data.edge_label_index[:, :10])
-    print(f"Предсказания для первых 10 тестовых пар:")
-    for i, pred in enumerate(predictions):
-        print(f"  Пара {i + 1}: вероятность связи = {pred:.4f}")
 
 
 if __name__ == "__main__":

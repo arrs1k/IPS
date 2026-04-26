@@ -107,9 +107,6 @@ def prepare_link_prediction_loaders(data, num_neighbors=[10, 5], batch_size=1024
 
 
 def visualize_top_nodes_with_edges(G, top_n=50, max_edges=500, figsize=(14, 10)):
-    """
-    Визуализирует топ N узлов по степени и их связи (оптимизированная версия)
-    """
     degrees = dict(G.degree())
     top_nodes = sorted(degrees.items(), key=lambda x: x[1], reverse=True)[:top_n]
     top_nodes_list = [node for node, deg in top_nodes]
