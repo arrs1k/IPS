@@ -52,3 +52,5 @@ if __name__ == "__main__":
     split_start = int(sys.argv[2])
     split_end = int(sys.argv[3])
     merge_split_csv(input_dir, split_start, split_end)
+
+#check
