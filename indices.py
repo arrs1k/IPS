@@ -83,18 +83,19 @@ def adamic_adar_scores(data, edge_label_index=None):
         weights = np.zeros_like(degrees, dtype=np.float32)
         mask = degrees > 1
         weights[mask] = 1.0 / np.log(degrees[mask])
+    
     W = diags(weights, format='csr')
     adj_weighted = adj @ W
 
     u = edge_label_index[0].cpu().numpy()
     v = edge_label_index[1].cpu().numpy()
-
+    
     scores = np.array(adj_weighted[u].multiply(adj[v]).sum(axis=1)).flatten()
-
+    
     return torch.tensor(scores, dtype=torch.float)
 
 
-def personalized_pagerank_scores(data, edge_label_index=None, alpha=0.85, tol=1e-6, max_iter=100):
+def personalized_pagerank_scores(data, edge_label_index=None, alpha=0.85, K=10):
     edge_index = data.edge_index
     num_nodes = data.num_nodes
     if edge_label_index is None:
@@ -103,34 +104,22 @@ def personalized_pagerank_scores(data, edge_label_index=None, alpha=0.85, tol=1e
     edge_index_und = to_undirected(edge_index, num_nodes=num_nodes)
     edge_index_und = torch.unique(edge_index_und, dim=1)
 
-    row, col = edge_index_und.cpu().numpy()
-    values = np.ones(len(row), dtype=np.float32)
-    adj = csr_matrix((values, (row, col)), shape=(num_nodes, num_nodes))
-
-    degrees = np.array(adj.sum(axis=1)).flatten()
-    deg_inv = np.zeros_like(degrees)
-    deg_inv[degrees > 0] = 1.0 / degrees[degrees > 0]
-    D_inv = diags(deg_inv, format='csr')
-    P = D_inv @ adj
-
-    u_nodes = edge_label_index[0].cpu().numpy()
-    v_nodes = edge_label_index[1].cpu().numpy()
-
-    scores = np.zeros(len(u_nodes), dtype=np.float32)
-    unique_u, inv_idx = np.unique(u_nodes, return_inverse=True)
-
-    for u in unique_u:
-        q = np.zeros(num_nodes, dtype=np.float32)
-        q[u] = 1.0
-        residual = 1.0
-        it = 0
-        while residual > tol and it < max_iter:
-            q_new = alpha * (P @ q) + (1 - alpha) * (np.arange(num_nodes) == u).astype(np.float32)
-            residual = np.linalg.norm(q_new - q, ord=1)
-            q = q_new
-            it += 1
-        mask = (inv_idx == np.where(unique_u == u)[0][0])
-        v_for_this_u = v_nodes[mask]
-        scores[mask] = q[v_for_this_u]
-
-    return torch.tensor(scores, dtype=torch.float)
+    u = edge_label_index[0]
+    v = edge_label_index[1]
+    
+    appnp = APPNP(K=K, alpha=alpha, cached=True, normalize=True)
+    
+    x = torch.eye(num_nodes, dtype=torch.float)
+    
+    with torch.no_grad():
+        ppr_matrix = appnp(x, edge_index_und)
+    
+    scores = torch.zeros(len(u), dtype=torch.float)
+    
+    unique_u = torch.unique(u)
+    for ui in unique_u:
+        mask = (u == ui)
+        v_indices = v[mask]
+        scores[mask] = ppr_matrix[ui][v_indices]
+    
+    return scores
