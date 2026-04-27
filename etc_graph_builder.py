@@ -45,7 +45,7 @@ def convert_to_pyg_data(G_nx):
 
     if not edges:
         print("Предупреждение: граф не содержит рёбер")
-        return Data(edge_index=torch.tensor([[], []], dtype=torch.long))
+        return Data(edge_index=torch.tensor([[], []], dtype=torch.long), num_nodes=0)
 
     src = [addr2idx[u] for u, v, w in edges]
     dst = [addr2idx[v] for u, v, w in edges]
@@ -53,7 +53,9 @@ def convert_to_pyg_data(G_nx):
 
     edge_index = torch.tensor([src, dst], dtype=torch.long)
     edge_attr = torch.tensor(weights, dtype=torch.float32).unsqueeze(1)
-    data = Data(edge_index=edge_index, edge_attr=edge_attr)
+
+    # Явно указываем num_nodes для устранения предупреждения
+    data = Data(edge_index=edge_index, edge_attr=edge_attr, num_nodes=len(nodes))
     return data
 
 
@@ -115,7 +117,6 @@ def visualize_top_nodes_with_edges(G, top_n=50, max_edges=500, figsize=(14, 10))
     for i, (node, deg) in enumerate(top_nodes[:5]):
         print(f"  {i + 1}. {str(node)[:20]}... степень: {deg}")
 
-    print("Создание подграфа...")
     subgraph = G.subgraph(top_nodes_list).copy()
 
     print(f"Исходный подграф: {subgraph.number_of_nodes()} узлов, {subgraph.number_of_edges()} рёбер")
@@ -138,38 +139,30 @@ def visualize_top_nodes_with_edges(G, top_n=50, max_edges=500, figsize=(14, 10))
         print("Не удалось создать подграф с рёбрами")
         return
 
-    print("Вычисление позиций узлов...")
-    pos = nx.spring_layout(subgraph, k=2.0, iterations=20, seed=42)
-
-    print("Отрисовка графа...")
     plt.figure(figsize=figsize)
+    pos = nx.spring_layout(subgraph, k=2.0, iterations=20, seed=42)
 
     deg_sub = dict(subgraph.degree())
     if deg_sub:
         max_deg_sub = max(deg_sub.values())
         if max_deg_sub > 0:
-            node_sizes = [500 + (deg_sub[n] / max_deg_sub) * 1500 for n in subgraph.nodes()]
+            node_sizes = [300 + (deg_sub[n] / max_deg_sub) * 1700 for n in subgraph.nodes()]
         else:
-            node_sizes = [800] * subgraph.number_of_nodes()
+            node_sizes = [500] * subgraph.number_of_nodes()
     else:
-        node_sizes = [800] * subgraph.number_of_nodes()
+        node_sizes = [500] * subgraph.number_of_nodes()
 
-    in_deg = dict(subgraph.in_degree())
-    out_deg = dict(subgraph.out_degree())
-    node_balance = [in_deg.get(n, 0) - out_deg.get(n, 0) for n in subgraph.nodes()]
+    node_colors = [deg_sub[n] for n in subgraph.nodes()]
 
     nodes_draw = nx.draw_networkx_nodes(subgraph, pos, node_size=node_sizes,
-                                        node_color=node_balance, cmap='RdBu', alpha=0.8)
+                                        node_color=node_colors, cmap='viridis', alpha=0.8)
 
     if nodes_draw:
-        plt.colorbar(nodes_draw, label='Баланс транзакций (получено - отправлено)')
+        plt.colorbar(nodes_draw, label='Количество транзакций')
 
-    nx.draw_networkx_edges(subgraph, pos, alpha=0.3, edge_color='gray',
+    nx.draw_networkx_edges(subgraph, pos, alpha=0.4, edge_color='gray',
                            arrows=True, arrowsize=8, width=0.8,
                            arrowstyle='->', connectionstyle='arc3,rad=0.1')
-
-    labels = {n: str(n)[:8] + '..' for n in subgraph.nodes()}
-    nx.draw_networkx_labels(subgraph, pos, labels, font_size=8, font_weight='bold')
 
     plt.title(f"Транзакционный граф Ethereum\n"
               f"{subgraph.number_of_nodes()} узлов, {subgraph.number_of_edges()} транзакций",

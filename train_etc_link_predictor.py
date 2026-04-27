@@ -1,7 +1,7 @@
 import torch
 import argparse
 from torch_geometric.transforms import RandomLinkSplit
-from ethereum_link_predictor import EthereumLinkPredictor, EthereumLinkPredictionTrainer
+from etc_link_predictor import EthereumLinkPredictor, EthereumLinkPredictionTrainer
 
 
 def main():
@@ -18,7 +18,7 @@ def main():
     print("=" * 60)
     print("ЗАГРУЗКА ГРАФА")
     print("=" * 60)
-    data = torch.load(args.graph_path)
+    data = torch.load(args.graph_path, weights_only=False)
     print(f"Граф загружен из {args.graph_path}")
     print(f"  - Вершин: {data.num_nodes:,}")
     print(f"  - Рёбер: {data.num_edges:,}")
