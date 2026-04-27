@@ -6,6 +6,7 @@ from torch_geometric.transforms import RandomLinkSplit
 from torch_geometric.loader import LinkNeighborLoader
 from torch_geometric.utils import degree, remove_self_loops
 from chartalist.common.bitcoin_graph_maker import BitcoinGraphMaker
+from indices import jaccard_scores, katz_scores, adamic_adar_scores, personalized_pagerank_scores
 
 
 def load_raw_data(in_path, out_path):
@@ -22,8 +23,8 @@ def load_raw_data(in_path, out_path):
 def collapse_transaction_vertices(G):
     tx_nodes = [node for node, attr in G.nodes(data=True) if attr.get('type') == 'trans']
     for tx in tx_nodes:
-        in_edges = list(G.in_edges(tx))   # (address, tx)
-        out_edges = list(G.out_edges(tx)) # (tx, address)
+        in_edges = list(G.in_edges(tx))
+        out_edges = list(G.out_edges(tx))
         for u, _ in in_edges:
             for _, v in out_edges:
                 if not G.has_edge(u, v):
@@ -91,6 +92,36 @@ def add_node_features(data):
     return data
 
 
+def add_heuristic_node_features(data):
+    num_nodes = data.num_nodes
+    edge_index = data.edge_index
+
+    edges = data.edge_index
+
+    in_deg = degree(edges[1], num_nodes=num_nodes, dtype=torch.float32)
+    out_deg = degree(edges[0], num_nodes=num_nodes, dtype=torch.float32)
+
+    def mean_score_per_node(score_func):
+        scores = score_func(Data(edge_index=edges, num_nodes=num_nodes), edge_label_index=edges)
+        aggregated = torch.zeros(num_nodes, dtype=torch.float32)
+        count = torch.zeros(num_nodes, dtype=torch.float32)
+        aggregated = aggregated.scatter_add(0, edges[0], scores)
+        count = count.scatter_add(0, edges[0], torch.ones_like(scores))
+        count[count == 0] = 1.0
+        return (aggregated / count).unsqueeze(1)
+
+    features = []
+    features.append(torch.stack([in_deg, out_deg], dim=1))
+
+    features.append(mean_score_per_node(jaccard_scores))
+    features.append(mean_score_per_node(adamic_adar_scores))
+    # features.append(mean_score_per_node(katz_scores))
+    # features.append(mean_score_per_node(personalized_pagerank_scores))
+
+    data.x = torch.cat(features, dim=1)
+    return data
+
+
 def save_data(data, path):
     torch.save(data, path)
 
@@ -117,13 +148,12 @@ def prepare_link_prediction_loaders(data, num_neighbors=[10, 5], batch_size=1024
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Построение графа транзакций Bitcoin и подготовка данных для link prediction")
-    parser.add_argument("in_file", help="Путь к объединённому CSV-файлу входов")
-    parser.add_argument("out_file", help="Путь к объединённому CSV-файлу выходов")
-    parser.add_argument("--save", default="bitcoin_split.pt", help="Имя файла для сохранения объекта Data")
-    parser.add_argument("--collapse-transactions", action="store_true",
-                        help="Построить граф адрес-адрес, удалив транзакционные вершины (вес ребра = 1)")
-    parser.add_argument("--remove-self-loops", action="store_true",
-                        help="Удалить петли")
+    parser.add_argument("in_file")
+    parser.add_argument("out_file")
+    parser.add_argument("--save", default="bitcoin_split.pt")
+    parser.add_argument("--collapse-transactions", action="store_true")
+    parser.add_argument("--remove-self-loops", action="store_true")
+    parser.add_argument("--use-heuristics", action="store_true")
     args = parser.parse_args()
 
     df_in, df_out = load_raw_data(args.in_file, args.out_file)
@@ -133,10 +163,15 @@ if __name__ == "__main__":
         G_nx = add_transaction_weights(G_nx, df_in, df_out)
 
     data = convert_to_pyg_data(G_nx)
-    data = add_node_features(data)
-    data.edge_index, data.edge_attr = remove_self_loops(data.edge_index, data.edge_attr)
-    save_data(data, args.save)
 
-    # train_loader, val_data, test_data = prepare_link_prediction_loaders(data)
+    if args.use_heuristics:
+        data = add_heuristic_node_features(data)
+    else:
+        data = add_node_features(data)
+
+    if args.remove_self_loops:
+        data.edge_index, data.edge_attr = remove_self_loops(data.edge_index, data.edge_attr)
+
+    save_data(data, args.save)
 
     print(f"Граф загружен: {data.num_nodes} вершин, {data.num_edges} рёбер")
