@@ -24,6 +24,7 @@ class LinkPredictor:
         for epoch in range(1, epochs + 1):
             self.model.train()
             total_loss = 0.0
+            total_edges = 0
             for batch in train_loader:
                 batch = batch.to(self.device)
                 self.optimizer.zero_grad()
@@ -37,9 +38,11 @@ class LinkPredictor:
                 loss = self.criterion(out.flatten(), batch.edge_label.float())
                 loss.backward()
                 self.optimizer.step()
-                total_loss += loss.item() * batch.num_graphs
+                num_edges = batch.edge_label.size(0)
+                total_loss += loss.item() * num_edges
+                total_edges += num_edges
 
-            avg_train_loss = total_loss / len(train_data)
+            avg_train_loss = total_loss / total_edges
             self.history['train_loss'].append(avg_train_loss)
 
             if val_data is not None:
@@ -63,6 +66,7 @@ class LinkPredictor:
                 **{k: v for k, v in self.loader_kwargs.items() if k != 'shuffle'}
             )
             total_loss = 0.0
+            total_edges = 0
             for batch in loader:
                 batch = batch.to(self.device)
                 x = batch.x
@@ -73,9 +77,11 @@ class LinkPredictor:
                 else:
                     out = self.model(x, edge_index, edge_label_index)
                 loss = self.criterion(out.flatten(), batch.edge_label.float())
-                total_loss += loss.item() * batch.num_graphs
+                num_edges = batch.edge_label.size(0)
+                total_loss += loss.item() * num_edges
+                total_edges += num_edges
 
-        return total_loss / len(data)
+        return total_loss / total_edges
 
     def predict(self, data):
         self.model.eval()
@@ -89,5 +95,4 @@ class LinkPredictor:
             else:
                 out = self.model(x, edge_index, edge_label_index)
             probs = torch.sigmoid(out).cpu()
-
         return probs.numpy().flatten()
