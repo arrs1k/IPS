@@ -9,7 +9,7 @@ from torch_geometric.transforms import RandomLinkSplit
 import torch.nn as nn
 from torch_geometric.nn import MessagePassing
 from torch_geometric.utils import add_self_loops, degree
-from link_predictor import LinkPredictor
+from btc_link_predictor import LinkPredictor
 class SymmetricNormConv(MessagePassing):
     def __init__(self, in_channels, out_channels):
         super().__init__(aggr='add')
