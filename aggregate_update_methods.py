@@ -301,16 +301,16 @@ def compare_all_combinations(data, results_file='comparison_results.csv', epochs
     histories = {}
     
     print("\n" + "=" * 80)
-    print("сравнение всех комбинаций aggregate и update")
+    print("Сравнение всех комбинаций aggregate и update")
     print("=" * 80)
-    print(f"всего комбинаций: {len(aggregate_methods) * len(update_methods)}")
-    print(f"эпох на модель: {epochs}")
+    print(f"Всего комбинаций: {len(aggregate_methods) * len(update_methods)}")
+    print(f"Эпох на модель: {epochs}")
     print("=" * 80)
     
     for agg in aggregate_methods:
         for upd in update_methods:
             combo_name = f"{agg}_{upd}"
-            print(f"\nтестирование: agg={agg}, update={upd}")
+            print(f"\nТестирование: agg={agg}, update={upd}")
             
             model_params = {
                 'in_channels': data.x.shape[1],
@@ -347,7 +347,7 @@ def compare_all_combinations(data, results_file='comparison_results.csv', epochs
                 print(f"   test auc: {test_auc:.4f}, лучший val auc: {result['best_val_auc']:.4f}")
                 
             except Exception as e:
-                print(f"   ошибка: {e}")
+                print(f"   Ошибка: {e}")
                 results.append({
                     'aggregate': agg,
                     'update': upd,
@@ -359,7 +359,7 @@ def compare_all_combinations(data, results_file='comparison_results.csv', epochs
     # сохраняем результаты
     df_results = pd.DataFrame(results)
     df_results.to_csv(results_file, index=False)
-    print(f"\nрезультаты сохранены в: {results_file}")
+    print(f"\nРезультаты сохранены в: {results_file}")
     
     return df_results, histories
 
@@ -394,9 +394,9 @@ def plot_comparison_results(results, save_path=None):
         ax1.text(bar.get_x() + bar.get_width()/2., bar.get_height() + 0.01,
                 f'{auc:.4f}', ha='center', va='bottom', fontsize=9, fontweight='bold')
     
-    ax1.set_xlabel('комбинация (aggregate + update)', fontsize=12)
+    ax1.set_xlabel('Комбинация (aggregate + update)', fontsize=12)
     ax1.set_ylabel('test auc', fontsize=12)
-    ax1.set_title('сравнение test auc для всех комбинаций', fontsize=14, fontweight='bold')
+    ax1.set_title('Сравнение test auc для всех комбинаций', fontsize=14, fontweight='bold')
     ax1.set_xticks(range(len(combinations)))
     ax1.set_xticklabels(combinations, rotation=45, ha='right')
     ax1.set_ylim([0.5, 1.0])
@@ -423,9 +423,9 @@ def plot_comparison_results(results, save_path=None):
     ax2.set_yticks(range(len(agg_methods)))
     ax2.set_xticklabels(upd_methods)
     ax2.set_yticklabels([m.upper() for m in agg_methods])
-    ax2.set_xlabel('метод update', fontsize=12)
-    ax2.set_ylabel('метод aggregate', fontsize=12)
-    ax2.set_title('тепловая карта test auc', fontsize=14, fontweight='bold')
+    ax2.set_xlabel('Метод update', fontsize=12)
+    ax2.set_ylabel('Метод aggregate', fontsize=12)
+    ax2.set_title('Тепловая карта test auc', fontsize=14, fontweight='bold')
     
     for i in range(len(agg_methods)):
         for j in range(len(upd_methods)):
@@ -469,8 +469,8 @@ def plot_all_learning_curves(histories, save_path=None):
             ax.plot(history['val_auc'], label='val auc', linewidth=2, color='orange')
         
         best_val = max(history['val_auc']) if history['val_auc'] else 0
-        ax.set_title(f'{combo_name}\nлучший val auc: {best_val:.4f}', fontsize=10)
-        ax.set_xlabel('эпоха')
+        ax.set_title(f'{combo_name}\nЛучший val auc: {best_val:.4f}', fontsize=10)
+        ax.set_xlabel('Эпоха')
         ax.set_ylabel('auc')
         ax.legend(fontsize=8)
         ax.grid(True, alpha=0.3)
@@ -503,7 +503,7 @@ def train_and_plot_all_combinations(data, epochs=30, save_dir='training_plots'):
     save_dir = f"{save_dir}_{timestamp}"
     os.makedirs(save_dir, exist_ok=True)
     
-    print(f"\nрезультаты будут сохранены в: {save_dir}/")
+    print(f"\nРезультаты будут сохранены в: {save_dir}/")
     
     # сравниваем все комбинации
     df_results, histories = compare_all_combinations(data, 
@@ -521,17 +521,17 @@ def train_and_plot_all_combinations(data, epochs=30, save_dir='training_plots'):
     best = df_results.loc[best_idx]
     
     print("\n" + "=" * 80)
-    print("лучшая комбинация методов")
+    print("Лучшая комбинация методов")
     print("=" * 80)
     print(f"   метод aggregate: {best['aggregate'].upper()}")
     print(f"   метод update: {best['update'].upper()}")
     print(f"   test auc: {best['test_auc']:.4f}")
     if 'best_val_auc' in best:
-        print(f"   лучший val auc: {best['best_val_auc']:.4f}")
+        print(f"   Лучший val auc: {best['best_val_auc']:.4f}")
     
     # рейтинг всех методов
     print("\n" + "=" * 80)
-    print("рейтинг методов по test auc")
+    print("Рейтинг методов по test auc")
     print("=" * 80)
     ranking = df_results.sort_values('test_auc', ascending=False)
     for i, row in ranking.iterrows():
@@ -541,8 +541,8 @@ def train_and_plot_all_combinations(data, epochs=30, save_dir='training_plots'):
     # сохраняем лучшую модель (если есть доступ к данным)
     try:
         best_combo_name = f"{best['aggregate']}_{best['update']}"
-        print(f"\nлучшая модель: {best_combo_name}")
-        print(f"результаты сохранены в: {save_dir}/")
+        print(f"\nЛучшая модель: {best_combo_name}")
+        print(f"Результаты сохранены в: {save_dir}/")
     except:
         pass
     
@@ -644,18 +644,18 @@ def get_method_description(method_name, method_type='aggregate'):
 def print_methods_info():
     """Печатает информацию о всех доступных методах."""
     print("\n" + "=" * 80)
-    print("доступные методы aggregate и update")
+    print("Доступные методы aggregate и update")
     print("=" * 80)
     
-    print("\nметоды aggregate (5):")
+    print("\nМетоды aggregate:")
     for method in ['mean', 'sym_norm', 'janossy', 'conv', 'attention']:
         print(f"   {method.upper():12} - {get_method_description(method, 'aggregate')}")
     
-    print("\nметоды update (2):")
+    print("\nМетоды update:")
     for method in ['self_loop', 'gru']:
         print(f"   {method.upper():12} - {get_method_description(method, 'update')}")
     
-    print("\nвсего комбинаций: 5 x 2 = 10")
+    print("\nВсего комбинаций: 5 x 2 = 10")
 
 
 # ============================================================================
@@ -664,7 +664,7 @@ def print_methods_info():
 
 if __name__ == "__main__":
     print("=" * 80)
-    print("библиотека для тестирования методов aggregate и update")
+    print("Библиотека для тестирования методов aggregate и update")
     print("=" * 80)
     
     # вывод информации о методах
@@ -673,7 +673,7 @@ if __name__ == "__main__":
     # загрузка графа (путь нужно указать)
     try:
         data = torch.load('ethereum_graph.pt', weights_only=False)
-        print(f"\nграф загружен: {data.num_nodes} вершин, {data.num_edges} рёбер")
+        print(f"\nГраф загружен: {data.num_nodes} вершин, {data.num_edges} рёбер")
         
         # запуск полного тестирования (раскомментируйте для выполнения)
         # df_results, histories = train_and_plot_all_combinations(
@@ -683,9 +683,9 @@ if __name__ == "__main__":
         # )
         
     except FileNotFoundError:
-        print("\nфайл ethereum_graph.pt не найден.")
-        print("пожалуйста, загрузите граф или укажите правильный путь.")
-        print("\nпример использования:")
+        print("\nФайл ethereum_graph.pt не найден.")
+        print("Пожалуйста, загрузите граф или укажите правильный путь.")
+        print("\nПример использования:")
         print("   from aggregate_update_methods import train_and_plot_all_combinations")
         print("   import torch")
         print("   data = torch.load('your_graph.pt')")
