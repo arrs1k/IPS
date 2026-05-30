@@ -12,7 +12,7 @@ def main():
     results, histories = train_and_plot_all_combinations(
         data=data,
         epochs=50,        
-        save_dir='my_experiment'
+        save_dir='etc_experiment_results'
     )
     
     print("\nЭксперимент завершён!")
