@@ -6,8 +6,11 @@ from torch_geometric.transforms import RandomLinkSplit
 from torch_geometric.loader import LinkNeighborLoader
 from sklearn.metrics import roc_auc_score
 import matplotlib.pyplot as plt
+from sklearn.metrics import RocCurveDisplay
 import copy
 from copy import deepcopy
+
+from torch_geometric.utils import degree, softmax
 
 
 class CustomMessagePassingLayer(MessagePassing):
@@ -304,7 +307,6 @@ class LinkPredictor:
 
     def plot_test_roc_curve(self):
         """Строит ROC‑кривую для тестового набора."""
-        from sklearn.metrics import RocCurveDisplay
         self.model.eval()
         all_probs = []
         all_labels = []

@@ -1,24 +1,8 @@
-# aggregate_update_methods.py
-"""
-Реализация 5 методов aggregate и 2 методов update для gnn.
-Используется в linkpredictor.py для экспериментов с разными архитектурами.
-
-Методы aggregate:
-    1. mean - классическое нормализованное обновление (среднее соседей)
-    2. sym_norm - симметрическая нормализация (kipf & welling, gcn)
-    3. janossy - janossy pooling с lstm
-    4. conv - свёрточная агрегация с обучаемыми весами
-    5. attention - attention-агрегация (gat style)
-
-Методы update:
-    1. self_loop - классическое self-loop обновление (aggr_out + x)
-    2. gru - gru-обновление (динамическая балансировка)
-"""
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import pandas as pd
+from LinkPredictor import *
 import numpy as np
 import matplotlib.pyplot as plt
 from datetime import datetime
@@ -34,251 +18,109 @@ from tqdm import tqdm
 # ============================================================================
 # базовый слой с конфигурируемыми aggregate и update
 # ============================================================================
-
-class ConfigurableGNNLayer(MessagePassing):
-    """
-    Универсальный слой, поддерживающий все комбинации aggregate и update.
-    
-    параметры:
-        in_dim: размерность входных признаков
-        out_dim: размерность выходных признаков
-        aggregate_method: метод агрегации ('mean', 'sym_norm', 'janossy', 'conv', 'attention')
-        update_method: метод обновления ('self_loop', 'gru')
-        attention_heads: количество голов в attention (для метода 'attention')
-        janossy_hidden: размерность скрытого слоя в janossy pooling
-    """
-    
-    def __init__(self, in_dim, out_dim, 
-                 aggregate_method='mean', 
-                 update_method='self_loop',
-                 attention_heads=4,
-                 janossy_hidden=64):
-        super().__init__(aggr='add' if aggregate_method in ['sym_norm', 'conv', 'attention'] else 'mean')
-        
-        self.aggregate_method = aggregate_method
-        self.update_method = update_method
-        self.attention_heads = attention_heads
-        self.janossy_hidden = janossy_hidden
-        
-        # базовое линейное преобразование
-        self.lin = nn.Linear(in_dim, out_dim, bias=False)
-        
-        # для sym_norm (кэш для нормализации)
-        self.norm = None
-        
-        # для conv (обучаемый вес)
-        if aggregate_method == 'conv':
-            self.conv_weight = nn.Parameter(torch.ones(1))
-        
-        # для attention
-        if aggregate_method == 'attention':
-            self.head_dim = out_dim // attention_heads
-            self.att_lin = nn.Linear(out_dim, attention_heads, bias=False)
-        
-        # для janossy (lstm для агрегации)
-        if aggregate_method == 'janossy':
-            self.janossy_lin = nn.Linear(in_dim, janossy_hidden)
-            self.janossy_lstm = nn.LSTM(janossy_hidden, janossy_hidden, 
-                                         batch_first=True, bidirectional=True)
-            self.janossy_out = nn.Linear(2 * janossy_hidden, out_dim)
-        
-        # для gru update
-        if update_method == 'gru':
-            self.gru = nn.GRUCell(out_dim, out_dim)
-    
-    def forward(self, x, edge_index):
-        """Прямой проход слоя."""
-        # предварительные вычисления для sym_norm
-        if self.aggregate_method == 'sym_norm':
-            row, col = edge_index
-            deg = degree(col, x.size(0), dtype=x.dtype)
-            deg_inv_sqrt = deg.pow(-0.5)
-            deg_inv_sqrt[deg_inv_sqrt == float('inf')] = 0
-            self.norm = deg_inv_sqrt[row] * deg_inv_sqrt[col]
-        
-        # janossy pooling требует особой обработки
-        if self.aggregate_method == 'janossy':
-            return self._janossy_forward(x, edge_index)
-        
-        # стандартный propagate для остальных методов
-        return self.propagate(edge_index, x=x)
-    
-    def message(self, x_i, x_j, index):
-        """Вычисление сообщений от соседей (aggregate)."""
-        
-        if self.aggregate_method == 'mean':
-            # 1. среднее соседей (нормализованное)
-            return self.lin(x_j)
-        
-        elif self.aggregate_method == 'sym_norm':
-            # 2. симметрическая нормализация (как в gcn)
-            return self.lin(x_j) * self.norm.view(-1, 1)
-        
-        elif self.aggregate_method == 'conv':
-            # 3. свёрточная агрегация с обучаемым весом
-            return self.lin(x_j) * self.conv_weight
-        
-        elif self.aggregate_method == 'attention':
-            # 4. attention-агрегация (gat style)
-            x_j_proj = self.lin(x_j)
-            x_i_proj = self.lin(x_i)
-            
-            # вычисляем attention веса
-            att = (x_i_proj * x_j_proj).sum(dim=-1, keepdim=True)
-            att = F.leaky_relu(att)
-            att = self.att_lin(att)
-            
-            # нормализация по соседям
-            att = torch.exp(att)
-            att_sum = self.propagate(index, x=att, aggr='mean')
-            att = att / (att_sum + 1e-8)
-            
-            return x_j_proj * att
-        
-        else:
-            return self.lin(x_j)
-    
-    def update(self, aggr_out, x):
-        """Обновление эмбеддингов вершин (update)."""
-        
-        if self.update_method == 'self_loop':
-            # 1. self-loop обновление (aggr_out + x)
-            return aggr_out + x
-        
-        elif self.update_method == 'gru':
-            # 2. gru-обновление
-            return self.gru(aggr_out, x)
-        
-        else:
-            return aggr_out + x
-    
-    def _janossy_forward(self, x, edge_index):
-        """
-        Janossy pooling через lstm.
-        Обрабатывает соседей как последовательность.
-        """
-        row, col = edge_index
-        
-        # собираем соседей для каждой вершины
-        neighbors = [[] for _ in range(x.size(0))]
-        for r, c in zip(row.tolist(), col.tolist()):
-            neighbors[r].append(c)
-        
-        outputs = []
-        for node in range(x.size(0)):
-            if len(neighbors[node]) == 0:
-                outputs.append(torch.zeros(self.lin.out_features, device=x.device))
-                continue
-            
-            # применяем линейное преобразование к соседям
-            neighbor_embs = self.janossy_lin(x[neighbors[node]])
-            neighbor_embs = F.relu(neighbor_embs).unsqueeze(0)
-            
-            # lstm агрегация
-            lstm_out, _ = self.janossy_lstm(neighbor_embs)
-            pooled = lstm_out.mean(dim=1).squeeze(0)
-            out = self.janossy_out(pooled)
-            outputs.append(out)
-        
-        aggr_out = torch.stack(outputs, dim=0)
-        
-        # применяем update
-        if self.update_method == 'self_loop':
-            return aggr_out + x
-        elif self.update_method == 'gru':
-            return self.gru(aggr_out, x)
-        else:
-            return aggr_out + x
-
-
-# ============================================================================
-# гибкая gnn модель
-# ============================================================================
-
-class FlexibleGNNModel(nn.Module):
-    """
-    Гибкая gnn модель для link prediction с конфигурируемыми aggregate и update.
-    
-    параметры:
-        in_channels: размерность входных признаков
-        hidden_channels: размерность скрытых слоёв (int или list)
-        out_channels: размерность выходных эмбеддингов
-        num_layers: количество слоёв
-        aggregate_method: метод агрегации
-        update_method: метод обновления
-        attention_heads: количество голов в attention
-        janossy_hidden: скрытая размерность для janossy
-        dropout: вероятность dropout
-    """
-    
-    def __init__(self, in_channels, hidden_channels=64, out_channels=64, num_layers=2,
-                 aggregate_method='mean', update_method='self_loop',
-                 attention_heads=4, janossy_hidden=64, dropout=0.0):
+class MeanMessage(nn.Module):
+    def __init__(self, in_dim, out_dim):
         super().__init__()
-        
-        self.aggregate_method = aggregate_method
-        self.update_method = update_method
-        self.dropout = dropout
-        self.num_layers = num_layers
-        
-        if isinstance(hidden_channels, int):
-            hidden_channels = [hidden_channels] * num_layers
-        
-        self.layers = nn.ModuleList()
-        self.norms = nn.ModuleList()
-        
-        # входной слой
-        self.layers.append(
-            ConfigurableGNNLayer(
-                in_channels, hidden_channels[0],
-                aggregate_method=aggregate_method,
-                update_method=update_method,
-                attention_heads=attention_heads,
-                janossy_hidden=janossy_hidden
-            )
-        )
-        self.norms.append(nn.LayerNorm(hidden_channels[0]))
-        
-        # скрытые слои
-        for i in range(num_layers - 1):
-            self.layers.append(
-                ConfigurableGNNLayer(
-                    hidden_channels[i], hidden_channels[i + 1],
-                    aggregate_method=aggregate_method,
-                    update_method=update_method,
-                    attention_heads=attention_heads,
-                    janossy_hidden=janossy_hidden
-                )
-            )
-            self.norms.append(nn.LayerNorm(hidden_channels[i + 1]))
-        
-        # выходная проекция
-        self.proj = nn.Linear(hidden_channels[-1], out_channels)
-    
-    def forward(self, x, edge_index, edge_label_index):
-        """Прямой проход для предсказания связей."""
-        z = self.encode(x, edge_index)
-        return self.decode(z, edge_label_index)
-    
-    def encode(self, x, edge_index):
-        """Получение эмбеддингов вершин."""
-        for i, (layer, norm) in enumerate(zip(self.layers, self.norms)):
-            x = layer(x, edge_index)
-            x = norm(x)
-            if i < self.num_layers - 1:
-                x = F.relu(x)
-                x = F.dropout(x, p=self.dropout, training=self.training)
-        return self.proj(x)
-    
-    def decode(self, z, edge_label_index):
-        """Декодирование эмбеддингов в вероятности связей."""
-        row, col = edge_label_index
-        return (z[row] * z[col]).sum(dim=-1)
+        self.lin = nn.Linear(in_dim, out_dim, bias=False)
+
+    def forward(self, x_j, x_i=None, edge_attr=None):
+        return self.lin(x_j)
 
 
-# ============================================================================
-# функции для сравнения методов
-# ============================================================================
+class SymNormMessage(nn.Module):
+    """Требует, чтобы norm был передан как edge_attr."""
+    def __init__(self, in_dim, out_dim):
+        super().__init__()
+        self.lin = nn.Linear(in_dim, out_dim, bias=False)
+
+    def forward(self, x_j, x_i=None, edge_attr=None):
+        # edge_attr -> norm (размер [E, 1])
+        return self.lin(x_j) * edge_attr
+
+
+class ConvMessage(nn.Module):
+    def __init__(self, in_dim, out_dim):
+        super().__init__()
+        self.lin = nn.Linear(in_dim, out_dim, bias=False)
+        self.conv_weight = nn.Parameter(torch.ones(1))
+
+    def forward(self, x_j, x_i=None, edge_attr=None):
+        return self.lin(x_j) * self.conv_weight
+
+
+class AttentionMessage(nn.Module):
+    """Нуждается в index, который передаётся через propagate."""
+    def __init__(self, in_dim, out_dim, heads=4):
+        super().__init__()
+        self.out_dim = out_dim          # ← сохраняем для использования в forward
+        self.heads = heads
+        self.head_dim = out_dim // heads
+        self.lin = nn.Linear(in_dim, out_dim, bias=False)
+        self.att_lin = nn.Linear(out_dim, heads, bias=False)
+
+    def forward(self, x_j, x_i, edge_attr=None, index=None):
+        x_j_proj = self.lin(x_j)        # [E, out_dim]
+        x_i_proj = self.lin(x_i)
+        att = (x_i_proj * x_j_proj).sum(dim=-1, keepdim=True)  # [E, 1]
+        att = F.leaky_relu(att)
+        att = self.att_lin(att)          # [E, heads]
+        att = softmax(att, index)        # index – номера получателей
+        # Взвешиваем и возвращаем плоский тензор [E, out_dim]
+        return (x_j_proj.view(-1, self.heads, self.head_dim) * att.unsqueeze(-1)).view(-1, self.out_dim)
+
+class SelfLoopUpdate(nn.Module):
+    """Остаточная связь с автоматической проекцией, если размерности не совпадают."""
+    def __init__(self, in_dim, out_dim):
+        super().__init__()
+        self.proj = nn.Linear(in_dim, out_dim, bias=False) if in_dim != out_dim else nn.Identity()
+
+    def forward(self, aggr_out, x):
+        return aggr_out + self.proj(x)
+
+
+class GRUUpdate(nn.Module):
+    def __init__(self, dim):
+        super().__init__()
+        self.gru = nn.GRUCell(dim, dim)
+
+    def forward(self, aggr_out, x):
+        return self.gru(aggr_out, x)
+
+def _aggregate_name(agg):
+    """Возвращает строковый идентификатор метода агрегации."""
+    if isinstance(agg, str):
+        return agg
+    # если передан класс, а не экземпляр
+    if isinstance(agg, type):
+        cls = agg
+    else:
+        cls = type(agg)
+
+    mapping = {
+        MeanMessage: 'mean',
+        SymNormMessage: 'sym_norm',
+        ConvMessage: 'conv',
+        AttentionMessage: 'attention',
+    }
+    return mapping.get(cls, cls.__name__)
+
+
+def _update_name(upd):
+    """Возвращает строковый идентификатор метода обновления."""
+    if isinstance(upd, str):
+        return upd
+    if isinstance(upd, type):
+        cls = upd
+    else:
+        cls = type(upd)
+
+    mapping = {
+        SelfLoopUpdate: 'self_loop',
+        GRUUpdate: 'gru',
+    }
+    return mapping.get(cls, cls.__name__)
+
+
 
 def compare_all_combinations(data, results_file='comparison_results.csv', epochs=50):
     """
@@ -293,9 +135,10 @@ def compare_all_combinations(data, results_file='comparison_results.csv', epochs
         dataframe с результатами всех комбинаций
     """
     from LinkPredictor import LinkPredictor
-    
-    aggregate_methods = ['mean', 'sym_norm', 'janossy', 'conv', 'attention']
-    update_methods = ['self_loop', 'gru']
+
+    aggregate_methods = [MeanMessage, SymNormMessage, ConvMessage, AttentionMessage]
+    update_methods = [SelfLoopUpdate, GRUUpdate]
+    names = []
     
     results = []
     histories = {}
@@ -325,7 +168,7 @@ def compare_all_combinations(data, results_file='comparison_results.csv', epochs
             try:
                 predictor = LinkPredictor(
                     data=data,
-                    model_class=FlexibleGNNModel,
+                    model_class=LinkPredictionMessagePassingModel,
                     model_params=model_params,
                     epochs=epochs,
                     patience=epochs // 3,
@@ -603,13 +446,13 @@ def create_model(aggregate_method, update_method, in_channels,
     возвращает:
         flexiblegnnmodel
     """
-    return FlexibleGNNModel(
+    return LinkPredictionMessagePassingModel(
         in_channels=in_channels,
         hidden_channels=hidden_channels,
         out_channels=out_channels,
         num_layers=num_layers,
-        aggregate_method=aggregate_method,
-        update_method=update_method,
+        aggr=aggregate_method,
+        update_fn=update_method,
         dropout=0.3,
     )
 
