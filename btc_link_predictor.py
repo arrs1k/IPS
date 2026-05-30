@@ -11,7 +11,7 @@ class LinkPredictor:
         self.model.to(self.device)
         self.use_edge_attr = use_edge_attr
         self.loader_kwargs = loader_kwargs
-        self.history = {'train_loss': [], 'val_loss': []}
+        self.history = {'train_loss': [], 'val_loss': [], 'train_roc_auc': [], 'train_auc_pr': []}
 
     def fit(self, train_data, val_data=None, epochs=100, verbose=True):
         train_loader = LinkNeighborLoader(
