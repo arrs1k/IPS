@@ -1,40 +1,28 @@
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
 import pandas as pd
 from LinkPredictor import *
 import numpy as np
 import matplotlib.pyplot as plt
 from datetime import datetime
 import os
-from torch_geometric.nn import MessagePassing
-from torch_geometric.utils import degree
-from torch_geometric.loader import LinkNeighborLoader
-from torch_geometric.transforms import RandomLinkSplit
-from sklearn.metrics import roc_auc_score
-from tqdm import tqdm
+from sklearn.metrics import average_precision_score, roc_auc_score
 
 
-# ============================================================================
-# базовый слой с конфигурируемыми aggregate и update
-# ============================================================================
 class MeanMessage(nn.Module):
     def __init__(self, in_dim, out_dim):
         super().__init__()
         self.lin = nn.Linear(in_dim, out_dim, bias=False)
 
-    def forward(self, x_j, x_i=None, edge_attr=None):
+    def forward(self, x_j, x_i=None, edge_attr=None, index=None):
         return self.lin(x_j)
 
 
 class SymNormMessage(nn.Module):
-    """Требует, чтобы norm был передан как edge_attr."""
     def __init__(self, in_dim, out_dim):
         super().__init__()
         self.lin = nn.Linear(in_dim, out_dim, bias=False)
+        self.is_sym_norm = True
 
-    def forward(self, x_j, x_i=None, edge_attr=None):
-        # edge_attr -> norm (размер [E, 1])
+    def forward(self, x_j, x_i=None, edge_attr=None, index=None):
         return self.lin(x_j) * edge_attr
 
 
@@ -44,32 +32,27 @@ class ConvMessage(nn.Module):
         self.lin = nn.Linear(in_dim, out_dim, bias=False)
         self.conv_weight = nn.Parameter(torch.ones(1))
 
-    def forward(self, x_j, x_i=None, edge_attr=None):
+    def forward(self, x_j, x_i=None, edge_attr=None, index=None):
         return self.lin(x_j) * self.conv_weight
 
 
 class AttentionMessage(nn.Module):
-    """Нуждается в index, который передаётся через propagate."""
     def __init__(self, in_dim, out_dim, heads=4):
         super().__init__()
-        self.out_dim = out_dim          # ← сохраняем для использования в forward
+        self.out_dim = out_dim
         self.heads = heads
         self.head_dim = out_dim // heads
         self.lin = nn.Linear(in_dim, out_dim, bias=False)
-        self.att_lin = nn.Linear(out_dim, heads, bias=False)
 
     def forward(self, x_j, x_i, edge_attr=None, index=None):
-        x_j_proj = self.lin(x_j)        # [E, out_dim]
-        x_i_proj = self.lin(x_i)
-        att = (x_i_proj * x_j_proj).sum(dim=-1, keepdim=True)  # [E, 1]
-        att = F.leaky_relu(att)
-        att = self.att_lin(att)          # [E, heads]
-        att = softmax(att, index)        # index – номера получателей
-        # Взвешиваем и возвращаем плоский тензор [E, out_dim]
-        return (x_j_proj.view(-1, self.heads, self.head_dim) * att.unsqueeze(-1)).view(-1, self.out_dim)
+        x_j_proj = self.lin(x_j).view(-1, self.heads, self.head_dim)
+        x_i_proj = self.lin(x_i).view(-1, self.heads, self.head_dim)
+        att = (x_i_proj * x_j_proj).sum(dim=-1)
+        att = softmax(att, index)
+        return (x_j_proj * att.unsqueeze(-1)).view(-1, self.out_dim)
+
 
 class SelfLoopUpdate(nn.Module):
-    """Остаточная связь с автоматической проекцией, если размерности не совпадают."""
     def __init__(self, in_dim, out_dim):
         super().__init__()
         self.proj = nn.Linear(in_dim, out_dim, bias=False) if in_dim != out_dim else nn.Identity()
@@ -79,23 +62,24 @@ class SelfLoopUpdate(nn.Module):
 
 
 class GRUUpdate(nn.Module):
-    def __init__(self, dim):
+    def __init__(self, in_dim, hidden_dim):
         super().__init__()
-        self.gru = nn.GRUCell(dim, dim)
+        self.proj = nn.Linear(in_dim, hidden_dim) if in_dim != hidden_dim else nn.Identity()
+        self.gru = nn.GRUCell(hidden_dim, hidden_dim)
 
     def forward(self, aggr_out, x):
+        x = self.proj(x)
         return self.gru(aggr_out, x)
+
 
 def _aggregate_name(agg):
     """Возвращает строковый идентификатор метода агрегации."""
     if isinstance(agg, str):
         return agg
-    # если передан класс, а не экземпляр
     if isinstance(agg, type):
         cls = agg
     else:
         cls = type(agg)
-
     mapping = {
         MeanMessage: 'mean',
         SymNormMessage: 'sym_norm',
@@ -113,7 +97,6 @@ def _update_name(upd):
         cls = upd
     else:
         cls = type(upd)
-
     mapping = {
         SelfLoopUpdate: 'self_loop',
         GRUUpdate: 'gru',
@@ -121,331 +104,229 @@ def _update_name(upd):
     return mapping.get(cls, cls.__name__)
 
 
-
 def compare_all_combinations(data, results_file='comparison_results.csv', epochs=50):
-    """
-    Сравнивает все 5x2 = 10 комбинаций методов aggregate и update.
-    
-    параметры:
-        data: граф (torch_geometric.data.data)
-        results_file: имя файла для сохранения результатов
-        epochs: количество эпох обучения
-    
-    возвращает:
-        dataframe с результатами всех комбинаций
-    """
-    from LinkPredictor import LinkPredictor
-
-    aggregate_methods = [MeanMessage, SymNormMessage, ConvMessage, AttentionMessage]
-    update_methods = [SelfLoopUpdate, GRUUpdate]
-    names = []
-    
+    aggregate_classes = [MeanMessage, SymNormMessage, ConvMessage, AttentionMessage]
+    update_classes = [SelfLoopUpdate, GRUUpdate]
     results = []
     histories = {}
-    
-    print("\n" + "=" * 80)
-    print("Сравнение всех комбинаций aggregate и update")
-    print("=" * 80)
-    print(f"Всего комбинаций: {len(aggregate_methods) * len(update_methods)}")
-    print(f"Эпох на модель: {epochs}")
-    print("=" * 80)
-    
-    for agg in aggregate_methods:
-        for upd in update_methods:
-            combo_name = f"{agg}_{upd}"
-            print(f"\nТестирование: agg={agg}, update={upd}")
-            
+    in_dim = data.x.shape[1]
+    hidden_dim = 64
+    out_dim = 64
+
+    for AggClass in aggregate_classes:
+        for UpdClass in update_classes:
+            combo_name = f"{AggClass.__name__}_{UpdClass.__name__}"
+            print(f"\nТестирование: agg={AggClass.__name__}, update={UpdClass.__name__}")
+
+            if AggClass == AttentionMessage:
+                msg_list = [AttentionMessage(in_dim, hidden_dim, heads=4),
+                            AttentionMessage(hidden_dim, hidden_dim, heads=4)]
+            else:
+                msg_list = [AggClass(in_dim, hidden_dim),
+                            AggClass(hidden_dim, hidden_dim)]
+
+            if UpdClass == SelfLoopUpdate:
+                upd_list = [SelfLoopUpdate(in_dim, hidden_dim),
+                            SelfLoopUpdate(hidden_dim, hidden_dim)]
+            else:
+                upd_list = [GRUUpdate(in_dim, hidden_dim),
+                            GRUUpdate(hidden_dim, hidden_dim)]
+
+            aggr_str = 'mean' if AggClass == MeanMessage else 'add'
             model_params = {
-                'in_channels': data.x.shape[1],
-                'hidden_channels': 64,
-                'out_channels': 64,
+                'in_channels': in_dim,
+                'hidden_channels': hidden_dim,
+                'out_channels': out_dim,
                 'num_layers': 2,
-                'aggregate_method': agg,
-                'update_method': upd,
+                'message_fn': msg_list,
+                'aggr': aggr_str,
+                'update_fn': upd_list,
                 'dropout': 0.3,
             }
-            
+
             try:
                 predictor = LinkPredictor(
-                    data=data,
-                    model_class=LinkPredictionMessagePassingModel,
-                    model_params=model_params,
-                    epochs=epochs,
-                    patience=epochs // 3,
+                    data=data, model_class=LinkPredictionMessagePassingModel,
+                    model_params=model_params, epochs=epochs, patience=epochs // 3
                 )
-                
-                model, test_auc = predictor.run()
-                
-                result = {
-                    'aggregate': agg,
-                    'update': upd,
-                    'test_auc': test_auc,
-                    'best_val_auc': max(predictor.history['val_auc']) if predictor.history['val_auc'] else 0,
-                    'best_val_loss': min(predictor.history['val_loss']) if predictor.history['val_loss'] else 0,
+                model, test_fpr, test_auprc = predictor.run()
+                best_val_fpr = min(predictor.history['val_fpr']) if predictor.history['val_fpr'] else 1.0
+                best_val_auprc = max(predictor.history['val_auprc']) if predictor.history['val_auprc'] else 0.0
+                res = {
+                    'aggregate': AggClass.__name__,
+                    'update': UpdClass.__name__,
+                    'test_fpr': test_fpr,
+                    'test_auprc': test_auprc,
+                    'best_val_fpr': best_val_fpr,
+                    'best_val_auprc': best_val_auprc,
                     'epochs_completed': len(predictor.history['train_loss']),
                 }
-                results.append(result)
+                results.append(res)
                 histories[combo_name] = predictor.history
-                
-                print(f"   test auc: {test_auc:.4f}, лучший val auc: {result['best_val_auc']:.4f}")
-                
+                print(f"   test fpr: {test_fpr:.4f}, test auprc: {test_auprc:.4f}, best val fpr: {best_val_fpr:.4f}")
             except Exception as e:
                 print(f"   Ошибка: {e}")
                 results.append({
-                    'aggregate': agg,
-                    'update': upd,
-                    'test_auc': 0,
-                    'error': str(e),
+                    'aggregate': AggClass.__name__,
+                    'update': UpdClass.__name__,
+                    'test_fpr': 1.0,
+                    'test_auprc': 0.0,
+                    'error': str(e)
                 })
                 histories[combo_name] = None
-    
-    # сохраняем результаты
+
     df_results = pd.DataFrame(results)
     df_results.to_csv(results_file, index=False)
     print(f"\nРезультаты сохранены в: {results_file}")
-    
     return df_results, histories
 
 
 def plot_comparison_results(results, save_path=None):
-    """
-    Визуализация результатов сравнения методов.
-    
-    параметры:
-        results: dataframe с результатами или путь к csv файлу
-        save_path: путь для сохранения графика
-    """
+    """Визуализация результатов: столбчатая диаграмма FPR и тепловая карта AUCPR."""
     if isinstance(results, str):
         df = pd.read_csv(results)
     else:
         df = results.copy()
-    
     if 'error' in df.columns:
         df = df[df['error'].isna()]
-    
+
     fig, axes = plt.subplots(1, 2, figsize=(16, 6))
-    
-    # график 1: барчарт test auc
+
     ax1 = axes[0]
-    combinations = [f"{row['aggregate']}\n{row['update']}" for _, row in df.iterrows()]
-    aucs = df['test_auc'].values
-    
-    colors = ['green' if auc >= 0.8 else 'orange' if auc >= 0.7 else 'red' for auc in aucs]
-    bars = ax1.bar(range(len(combinations)), aucs, color=colors, edgecolor='black', linewidth=1.5)
-    
-    for bar, auc in zip(bars, aucs):
+    combos = [f"{r['aggregate']}\n{r['update']}" for _, r in df.iterrows()]
+    fprs = df['test_fpr'].values
+    colors = ['green' if f <= 0.3 else 'orange' if f <= 0.5 else 'red' for f in fprs]
+    bars = ax1.bar(range(len(combos)), fprs, color=colors, edgecolor='black', linewidth=1.5)
+    for bar, f in zip(bars, fprs):
         ax1.text(bar.get_x() + bar.get_width()/2., bar.get_height() + 0.01,
-                f'{auc:.4f}', ha='center', va='bottom', fontsize=9, fontweight='bold')
-    
-    ax1.set_xlabel('Комбинация (aggregate + update)', fontsize=12)
-    ax1.set_ylabel('test auc', fontsize=12)
-    ax1.set_title('Сравнение test auc для всех комбинаций', fontsize=14, fontweight='bold')
-    ax1.set_xticks(range(len(combinations)))
-    ax1.set_xticklabels(combinations, rotation=45, ha='right')
-    ax1.set_ylim([0.5, 1.0])
-    ax1.axhline(y=0.7, color='orange', linestyle='--', alpha=0.5, label='хорошо (0.7)')
-    ax1.axhline(y=0.8, color='green', linestyle='--', alpha=0.5, label='отлично (0.8)')
+                 f'{f:.4f}', ha='center', va='bottom', fontsize=9, fontweight='bold')
+    ax1.set_xlabel('Комбинация')
+    ax1.set_ylabel('Test FPR')
+    ax1.set_title('Сравнение Test FPR')
+    ax1.set_xticks(range(len(combos)))
+    ax1.set_xticklabels(combos, rotation=45, ha='right')
+    ax1.axhline(y=0.3, color='green', linestyle='--', alpha=0.5, label='отлично ≤0.3')
+    ax1.axhline(y=0.5, color='orange', linestyle='--', alpha=0.5, label='приемлемо ≤0.5')
     ax1.legend()
-    ax1.grid(True, alpha=0.3, axis='y')
-    
-    # график 2: тепловая карта
+    ax1.grid(True, axis='y', alpha=0.3)
+
     ax2 = axes[1]
     agg_methods = df['aggregate'].unique()
     upd_methods = df['update'].unique()
-    
-    heatmap_data = np.zeros((len(agg_methods), len(upd_methods)))
+    heatmap = np.zeros((len(agg_methods), len(upd_methods)))
     for i, agg in enumerate(agg_methods):
         for j, upd in enumerate(upd_methods):
             row = df[(df['aggregate'] == agg) & (df['update'] == upd)]
             if len(row) > 0:
-                heatmap_data[i, j] = row['test_auc'].values[0]
-    
-    im = ax2.imshow(heatmap_data, cmap='RdYlGn', aspect='auto', vmin=0.5, vmax=0.9)
-    
+                heatmap[i, j] = row['test_auprc'].values[0]
+    im = ax2.imshow(heatmap, cmap='RdYlGn', aspect='auto', vmin=0.0, vmax=1.0)
     ax2.set_xticks(range(len(upd_methods)))
     ax2.set_yticks(range(len(agg_methods)))
     ax2.set_xticklabels(upd_methods)
     ax2.set_yticklabels([m.upper() for m in agg_methods])
-    ax2.set_xlabel('Метод update', fontsize=12)
-    ax2.set_ylabel('Метод aggregate', fontsize=12)
-    ax2.set_title('Тепловая карта test auc', fontsize=14, fontweight='bold')
-    
+    ax2.set_xlabel('Метод update')
+    ax2.set_ylabel('Метод aggregate')
+    ax2.set_title('Тепловая карта Test AUCPR')
     for i in range(len(agg_methods)):
         for j in range(len(upd_methods)):
-            ax2.text(j, i, f'{heatmap_data[i, j]:.4f}',
-                    ha="center", va="center", color="black", fontsize=10, fontweight='bold')
-    
+            ax2.text(j, i, f'{heatmap[i, j]:.4f}',
+                     ha="center", va="center", color="black", fontsize=10, fontweight='bold')
     cbar = plt.colorbar(im, ax=ax2)
-    cbar.set_label('test auc', fontsize=10)
-    
+    cbar.set_label('Test AUCPR')
     plt.tight_layout()
-    
     if save_path:
         plt.savefig(save_path, dpi=150, bbox_inches='tight')
     plt.show()
 
 
 def plot_all_learning_curves(histories, save_path=None):
-    """
-    Рисует learning curves (auc) для всех комбинаций.
-    
-    параметры:
-        histories: словарь {combo_name: history}
-        save_path: путь для сохранения графика
-    """
+    """Рисует кривые обучения (AUCPR) для всех комбинаций."""
     n_combos = len(histories)
     n_cols = 5
     n_rows = (n_combos + n_cols - 1) // n_cols
-    
     fig, axes = plt.subplots(n_rows, n_cols, figsize=(20, 4 * n_rows))
     axes = axes.flatten()
-    
     for idx, (combo_name, history) in enumerate(histories.items()):
         if history is None:
             continue
-            
         ax = axes[idx]
-        
-        if 'train_auc' in history:
-            ax.plot(history['train_auc'], label='train auc', linewidth=2, color='blue')
-        if 'val_auc' in history:
-            ax.plot(history['val_auc'], label='val auc', linewidth=2, color='orange')
-        
-        best_val = max(history['val_auc']) if history['val_auc'] else 0
-        ax.set_title(f'{combo_name}\nЛучший val auc: {best_val:.4f}', fontsize=10)
+        if 'train_auprc' in history:
+            ax.plot(history['train_auprc'], label='train auprc', linewidth=2, color='blue')
+        if 'val_auprc' in history:
+            ax.plot(history['val_auprc'], label='val auprc', linewidth=2, color='orange')
+        best_val = max(history['val_auprc']) if history['val_auprc'] else 0.0
+        ax.set_title(f'{combo_name}\nЛучший val auprc: {best_val:.4f}', fontsize=10)
         ax.set_xlabel('Эпоха')
-        ax.set_ylabel('auc')
+        ax.set_ylabel('AUCPR')
         ax.legend(fontsize=8)
         ax.grid(True, alpha=0.3)
-        ax.set_ylim([0.5, 1.0])
-    
-    # скрываем лишние подграфики
+        ax.set_ylim([0.0, 1.0])
     for idx in range(len(histories), len(axes)):
         axes[idx].set_visible(False)
-    
-    plt.suptitle('кривые обучения для всех комбинаций aggregate-update', 
-                 fontsize=14, fontweight='bold')
+    plt.suptitle('Кривые обучения (AUCPR)', fontsize=14, fontweight='bold')
     plt.tight_layout()
-    
     if save_path:
         plt.savefig(save_path, dpi=150, bbox_inches='tight')
     plt.show()
 
 
 def train_and_plot_all_combinations(data, epochs=30, save_dir='training_plots'):
-    """
-    Обучает все комбинации и сохраняет результаты.
-    
-    параметры:
-        data: граф (torch_geometric.data.data)
-        epochs: количество эпох
-        save_dir: директория для сохранения графиков
-    """
-    # создаём директорию для сохранения
+    """Обучает все комбинации, сохраняет результаты и графики."""
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     save_dir = f"{save_dir}_{timestamp}"
     os.makedirs(save_dir, exist_ok=True)
-    
     print(f"\nРезультаты будут сохранены в: {save_dir}/")
-    
-    # сравниваем все комбинации
-    df_results, histories = compare_all_combinations(data, 
+
+    df_results, histories = compare_all_combinations(data,
                                                       results_file=f'{save_dir}/results.csv',
                                                       epochs=epochs)
-    
-    # сохраняем и отображаем learning curves
     plot_all_learning_curves(histories, save_path=f'{save_dir}/learning_curves.png')
-    
-    # сохраняем и отображаем сравнение
     plot_comparison_results(df_results, save_path=f'{save_dir}/comparison.png')
-    
-    # вывод лучшей комбинации
-    best_idx = df_results['test_auc'].idxmax()
+
+    best_idx = df_results['test_auprc'].idxmax()
     best = df_results.loc[best_idx]
-    
     print("\n" + "=" * 80)
-    print("Лучшая комбинация методов")
+    print("Лучшая комбинация по AUCPR")
     print("=" * 80)
     print(f"   метод aggregate: {best['aggregate'].upper()}")
     print(f"   метод update: {best['update'].upper()}")
-    print(f"   test auc: {best['test_auc']:.4f}")
-    if 'best_val_auc' in best:
-        print(f"   Лучший val auc: {best['best_val_auc']:.4f}")
-    
-    # рейтинг всех методов
-    print("\n" + "=" * 80)
-    print("Рейтинг методов по test auc")
-    print("=" * 80)
-    ranking = df_results.sort_values('test_auc', ascending=False)
+    print(f"   test FPR: {best['test_fpr']:.4f}")
+    print(f"   test AUCPR: {best['test_auprc']:.4f}")
+
+    print("\nРейтинг по test AUCPR:")
+    ranking = df_results.sort_values('test_auprc', ascending=False)
     for i, row in ranking.iterrows():
-        rank = f"{i+1}."
-        print(f"   {rank:3} {row['aggregate'].upper():12} + {row['update'].upper():12} : {row['test_auc']:.4f}")
-    
-    # сохраняем лучшую модель (если есть доступ к данным)
-    try:
-        best_combo_name = f"{best['aggregate']}_{best['update']}"
-        print(f"\nЛучшая модель: {best_combo_name}")
-        print(f"Результаты сохранены в: {save_dir}/")
-    except:
-        pass
-    
+        print(f"   {i+1:2d}. {row['aggregate']:12} + {row['update']:12} : FPR={row['test_fpr']:.4f}, AUCPR={row['test_auprc']:.4f}")
     return df_results, histories
 
 
 def create_model_summary_table(df_results):
-    """
-    Создаёт сводную таблицу с результатами.
-    
-    параметры:
-        df_results: dataframe с результатами
-    
-    возвращает:
-        dataframe со сводной статистикой
-    """
+    """Создаёт сводную таблицу средних значений AUCPR по методам."""
     summary = []
-    
-    # статистика по aggregate методам
-    agg_stats = df_results.groupby('aggregate')['test_auc'].agg(['mean', 'std', 'max']).round(4)
+    agg_stats = df_results.groupby('aggregate')['test_auprc'].agg(['mean', 'std', 'max']).round(4)
     for agg in agg_stats.index:
         summary.append({
             'категория': 'aggregate',
             'метод': agg,
-            'средний auc': agg_stats.loc[agg, 'mean'],
-            'std auc': agg_stats.loc[agg, 'std'],
-            'макс auc': agg_stats.loc[agg, 'max'],
+            'средний AUCPR': agg_stats.loc[agg, 'mean'],
+            'std AUCPR': agg_stats.loc[agg, 'std'],
+            'макс AUCPR': agg_stats.loc[agg, 'max'],
         })
-    
-    # статистика по update методам
-    upd_stats = df_results.groupby('update')['test_auc'].agg(['mean', 'std', 'max']).round(4)
+    upd_stats = df_results.groupby('update')['test_auprc'].agg(['mean', 'std', 'max']).round(4)
     for upd in upd_stats.index:
         summary.append({
             'категория': 'update',
             'метод': upd,
-            'средний auc': upd_stats.loc[upd, 'mean'],
-            'std auc': upd_stats.loc[upd, 'std'],
-            'макс auc': upd_stats.loc[upd, 'max'],
+            'средний AUCPR': upd_stats.loc[upd, 'mean'],
+            'std AUCPR': upd_stats.loc[upd, 'std'],
+            'макс AUCPR': upd_stats.loc[upd, 'max'],
         })
-    
     return pd.DataFrame(summary)
 
 
-# ============================================================================
-# вспомогательные функции
-# ============================================================================
-
-def create_model(aggregate_method, update_method, in_channels, 
+def create_model(aggregate_method, update_method, in_channels,
                  hidden_channels=64, out_channels=64, num_layers=2):
-    """
-    Создаёт модель с заданными методами aggregate и update.
-    
-    параметры:
-        aggregate_method: метод агрегации
-        update_method: метод обновления
-        in_channels: размерность входных признаков
-    
-    возвращает:
-        flexiblegnnmodel
-    """
+    """Создаёт модель с заданными методами aggregate и update."""
     return LinkPredictionMessagePassingModel(
         in_channels=in_channels,
         hidden_channels=hidden_channels,
@@ -458,30 +339,21 @@ def create_model(aggregate_method, update_method, in_channels,
 
 
 def get_method_description(method_name, method_type='aggregate'):
-    """
-    Возвращает описание метода.
-    
-    параметры:
-        method_name: название метода
-        method_type: 'aggregate' или 'update'
-    
-    возвращает:
-        str: описание метода
-    """
+    """Возвращает описание метода."""
     descriptions = {
         'aggregate': {
-            'mean': 'классическое нормализованное обновление. сообщение = среднее значение соседей.',
-            'sym_norm': 'симметрическая нормализация (как в gcn). учитывает степени вершин.',
-            'janossy': 'janossy pooling через lstm. обрабатывает соседей как последовательность.',
-            'conv': 'свёрточная агрегация с обучаемыми весами.',
-            'attention': 'attention-агрегация (gat style). учится взвешивать соседей.',
+            'mean': 'Классическое нормализованное обновление.',
+            'sym_norm': 'Симметрическая нормализация (GCN).',
+            'janossy': 'Janossy pooling через LSTM.',
+            'conv': 'Свёрточная агрегация с обучаемыми весами.',
+            'attention': 'Attention-агрегация (GAT style).',
         },
         'update': {
-            'self_loop': 'классическое self-loop обновление. h_new = aggr_out + x',
-            'gru': 'gru-обновление. динамическая балансировка информации.',
+            'self_loop': 'Классическое self-loop обновление.',
+            'gru': 'GRU-обновление.',
         }
     }
-    return descriptions.get(method_type, {}).get(method_name, 'описание не найдено')
+    return descriptions.get(method_type, {}).get(method_name, 'Описание не найдено')
 
 
 def print_methods_info():
@@ -489,47 +361,97 @@ def print_methods_info():
     print("\n" + "=" * 80)
     print("Доступные методы aggregate и update")
     print("=" * 80)
-    
     print("\nМетоды aggregate:")
     for method in ['mean', 'sym_norm', 'janossy', 'conv', 'attention']:
         print(f"   {method.upper():12} - {get_method_description(method, 'aggregate')}")
-    
     print("\nМетоды update:")
     for method in ['self_loop', 'gru']:
         print(f"   {method.upper():12} - {get_method_description(method, 'update')}")
-    
     print("\nВсего комбинаций: 5 x 2 = 10")
 
 
-# ============================================================================
-# пример использования
-# ============================================================================
+class DataLeakError(Exception):
+    """Обнаружена утечка данных."""
+    pass
 
-if __name__ == "__main__":
-    print("=" * 80)
-    print("Библиотека для тестирования методов aggregate и update")
-    print("=" * 80)
-    
-    # вывод информации о методах
-    print_methods_info()
-    
-    # загрузка графа (путь нужно указать)
-    try:
-        data = torch.load('ethereum_graph.pt', weights_only=False)
-        print(f"\nГраф загружен: {data.num_nodes} вершин, {data.num_edges} рёбер")
-        
-        # запуск полного тестирования (раскомментируйте для выполнения)
-        # df_results, histories = train_and_plot_all_combinations(
-        #     data=data,
-        #     epochs=30,
-        #     save_dir='ethereum_experiment'
-        # )
-        
-    except FileNotFoundError:
-        print("\nФайл ethereum_graph.pt не найден.")
-        print("Пожалуйста, загрузите граф или укажите правильный путь.")
-        print("\nПример использования:")
-        print("   from aggregate_update_methods import train_and_plot_all_combinations")
-        print("   import torch")
-        print("   data = torch.load('your_graph.pt')")
-        print("   results = train_and_plot_all_combinations(data, epochs=30)")
+
+class MetricMismatchError(Exception):
+    """Сохранённые метрики не совпадают с пересчитанными."""
+    pass
+
+
+def diagnose_link_predictor(predictor, tolerance=1e-3):
+    """
+    Проверяет модель и пайплайн на утечки данных и корректность метрик.
+    Бросает исключения при критических проблемах.
+    Возвращает fig с диагностическими графиками и словарь с результатами.
+    """
+    required_attrs = ['train_data', 'val_data', 'test_data', 'train_loader', 'val_loader',
+                      'test_loader', 'model', 'device', 'test_fpr', 'test_auprc']
+    for attr in required_attrs:
+        if not hasattr(predictor, attr):
+            raise AttributeError(f"predictor должен иметь атрибут '{attr}'")
+
+    train_data = predictor.train_data
+    mp_edges = set(map(tuple, train_data.edge_index.t().tolist()))
+
+    if (id(predictor.val_loader.data) != id(train_data) or
+        id(predictor.test_loader.data) != id(train_data)):
+        raise DataLeakError("val/test загрузчики используют граф, отличный от train_data")
+
+    for name, data in [("val", predictor.val_data), ("test", predictor.test_data)]:
+        pos_mask = data.edge_label.bool()
+        target_pos = set(map(tuple, data.edge_label_index[:, pos_mask].t().tolist()))
+        if len(target_pos & mp_edges) > 0:
+            raise DataLeakError(f"Целевые рёбра {name} пересекаются с графом message passing")
+
+    model = predictor.model
+    device = predictor.device
+    model.eval()
+    all_probs, all_labels = [], []
+    with torch.no_grad():
+        for batch in predictor.test_loader:
+            batch = batch.to(device)
+            logits = model(batch.x, batch.edge_index, batch.edge_label_index)
+            probs = torch.sigmoid(logits).cpu()
+            all_probs.append(probs)
+            all_labels.append(batch.edge_label.cpu())
+    all_probs = torch.cat(all_probs).numpy()
+    all_labels = torch.cat(all_labels).numpy()
+
+    auprc_calc = average_precision_score(all_labels, all_probs)
+    auc_calc = roc_auc_score(all_labels, all_probs)
+    preds = (all_probs > 0.5).astype(float)
+    fpr_calc = preds[all_labels == 0].mean() if (all_labels == 0).sum() > 0 else 0.0
+
+    if (abs(auprc_calc - predictor.test_auprc) > tolerance or
+        abs(fpr_calc - predictor.test_fpr) > tolerance):
+        raise MetricMismatchError(
+            f"Метрики расходятся: AUCPR {auprc_calc:.4f} vs {predictor.test_auprc:.4f}, "
+            f"FPR {fpr_calc:.4f} vs {predictor.test_fpr:.4f}"
+        )
+
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 4))
+    ax1.hist(all_probs[all_labels == 1], bins=40, alpha=0.6, label='Positive', color='blue')
+    ax1.hist(all_probs[all_labels == 0], bins=40, alpha=0.6, label='Negative', color='red')
+    ax1.set_xlabel('Predicted probability')
+    ax1.set_ylabel('Frequency')
+    ax1.set_title('Probability distribution (test)')
+    ax1.legend()
+    ax1.grid(alpha=0.3)
+
+    PrecisionRecallDisplay.from_predictions(all_labels, all_probs, ax=ax2, name='Model')
+    ax2.set_title('Precision-Recall curve (test)')
+    ax2.grid(alpha=0.3)
+
+    fig.tight_layout()
+
+    results = {
+        'auprc': auprc_calc,
+        'auc_roc': auc_calc,
+        'fpr': fpr_calc,
+        'mean_prob_positive': float(all_probs[all_labels == 1].mean()),
+        'mean_prob_negative': float(all_probs[all_labels == 0].mean()),
+        'leak_detected': False
+    }
+    return fig, results
