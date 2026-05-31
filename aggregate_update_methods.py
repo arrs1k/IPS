@@ -73,7 +73,6 @@ class GRUUpdate(nn.Module):
 
 
 def _aggregate_name(agg):
-    """Возвращает строковый идентификатор метода агрегации."""
     if isinstance(agg, str):
         return agg
     if isinstance(agg, type):
@@ -90,7 +89,6 @@ def _aggregate_name(agg):
 
 
 def _update_name(upd):
-    """Возвращает строковый идентификатор метода обновления."""
     if isinstance(upd, str):
         return upd
     if isinstance(upd, type):
@@ -104,8 +102,10 @@ def _update_name(upd):
     return mapping.get(cls, cls.__name__)
 
 def compare_all_combinations(train_loader, val_loader, test_loader,
-                                 train_data, val_data, test_data,
-                                 results_file='comparison_results.csv', epochs=50):
+                             train_data, val_data, test_data,
+                             results_file='comparison_results.csv', epochs=50,
+                             hidden_dim=64, out_dim=64, dropout=0.3, num_layers=2,
+                             attention_heads=4, **extra_model_params):
     aggregate_classes = [MeanMessage, SymNormMessage, ConvMessage, AttentionMessage]
     update_classes = [SelfLoopUpdate, GRUUpdate]
     results = []
@@ -113,8 +113,6 @@ def compare_all_combinations(train_loader, val_loader, test_loader,
     figs = {}
     diag_results = []
     in_dim = train_data.x.shape[1]
-    hidden_dim = 64
-    out_dim = 64
 
     for AggClass in aggregate_classes:
         for UpdClass in update_classes:
@@ -122,30 +120,40 @@ def compare_all_combinations(train_loader, val_loader, test_loader,
             print(f"\nТестирование: agg={AggClass.__name__}, update={UpdClass.__name__}")
 
             if AggClass == AttentionMessage:
-                msg_list = [AttentionMessage(in_dim, hidden_dim, heads=4),
-                            AttentionMessage(hidden_dim, hidden_dim, heads=4)]
+                msg_list = [
+                    AttentionMessage(in_dim if i == 0 else hidden_dim,
+                                     hidden_dim, heads=attention_heads)
+                    for i in range(num_layers)
+                ]
             else:
-                msg_list = [AggClass(in_dim, hidden_dim),
-                            AggClass(hidden_dim, hidden_dim)]
+                msg_list = [
+                    AggClass(in_dim if i == 0 else hidden_dim, hidden_dim)
+                    for i in range(num_layers)
+                ]
 
             if UpdClass == SelfLoopUpdate:
-                upd_list = [SelfLoopUpdate(in_dim, hidden_dim),
-                            SelfLoopUpdate(hidden_dim, hidden_dim)]
+                upd_list = [
+                    SelfLoopUpdate(in_dim if i == 0 else hidden_dim, hidden_dim)
+                    for i in range(num_layers)
+                ]
             else:
-                upd_list = [GRUUpdate(in_dim, hidden_dim),
-                            GRUUpdate(hidden_dim, hidden_dim)]
+                upd_list = [
+                    GRUUpdate(in_dim if i == 0 else hidden_dim, hidden_dim)
+                    for i in range(num_layers)
+                ]
 
             aggr_str = 'mean' if AggClass == MeanMessage else 'add'
             model_params = {
                 'in_channels': in_dim,
                 'hidden_channels': hidden_dim,
                 'out_channels': out_dim,
-                'num_layers': 2,
+                'num_layers': num_layers,
                 'message_fn': msg_list,
                 'aggr': aggr_str,
                 'update_fn': upd_list,
-                'dropout': 0.3,
+                'dropout': dropout,
             }
+            model_params.update(extra_model_params)
 
             try:
                 predictor = LinkPredictor(
@@ -195,7 +203,6 @@ def compare_all_combinations(train_loader, val_loader, test_loader,
     return df_results, histories, figs, diag_results
 
 def plot_comparison_results(results, save_path=None):
-    """Визуализация результатов: столбчатая диаграмма FPR и тепловая карта AUCPR."""
     if isinstance(results, str):
         df = pd.read_csv(results)
     else:
@@ -253,7 +260,6 @@ def plot_comparison_results(results, save_path=None):
 
 
 def plot_all_learning_curves(histories, save_path=None):
-    """Рисует кривые обучения (AUCPR) для всех комбинаций."""
     n_combos = len(histories)
     n_cols = 5
     n_rows = (n_combos + n_cols - 1) // n_cols
@@ -283,9 +289,10 @@ def plot_all_learning_curves(histories, save_path=None):
     plt.show()
 
 def train_and_plot_all_combinations(train_loader, val_loader, test_loader,
-                                        train_data, val_data, test_data,
-                                        epochs=30, save_dir='training_plots'):
-    """Обучает все комбинации, сохраняет результаты и графики."""
+                                    train_data, val_data, test_data,
+                                    epochs=30, save_dir='training_plots',
+                                    hidden_dim=64, out_dim=64, dropout=0.3, num_layers=2,
+                                    attention_heads=4, **extra_model_params):
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     save_dir = f"{save_dir}_{timestamp}"
     os.makedirs(save_dir, exist_ok=True)
@@ -295,7 +302,13 @@ def train_and_plot_all_combinations(train_loader, val_loader, test_loader,
         train_loader, val_loader, test_loader,
         train_data, val_data, test_data,
         results_file=f'{save_dir}/results.csv',
-        epochs=epochs
+        epochs=epochs,
+        hidden_dim=hidden_dim,
+        out_dim=out_dim,
+        dropout=dropout,
+        num_layers=num_layers,
+        attention_heads=attention_heads,
+        **extra_model_params
     )
     plot_all_learning_curves(histories, save_path=f'{save_dir}/learning_curves.png')
     plot_comparison_results(df_results, save_path=f'{save_dir}/comparison.png')
@@ -326,10 +339,7 @@ def train_and_plot_all_combinations(train_loader, val_loader, test_loader,
     return df_results, histories
 
 
-
-
 def create_model_summary_table(df_results):
-    """Создаёт сводную таблицу средних значений AUCPR по методам."""
     summary = []
     agg_stats = df_results.groupby('aggregate')['test_auprc'].agg(['mean', 'std', 'max']).round(4)
     for agg in agg_stats.index:
@@ -354,7 +364,6 @@ def create_model_summary_table(df_results):
 
 def create_model(aggregate_method, update_method, in_channels,
                  hidden_channels=64, out_channels=64, num_layers=2):
-    """Создаёт модель с заданными методами aggregate и update."""
     return LinkPredictionMessagePassingModel(
         in_channels=in_channels,
         hidden_channels=hidden_channels,
@@ -367,7 +376,6 @@ def create_model(aggregate_method, update_method, in_channels,
 
 
 def get_method_description(method_name, method_type='aggregate'):
-    """Возвращает описание метода."""
     descriptions = {
         'aggregate': {
             'mean': 'Классическое нормализованное обновление.',
@@ -385,7 +393,6 @@ def get_method_description(method_name, method_type='aggregate'):
 
 
 def print_methods_info():
-    """Печатает информацию о всех доступных методах."""
     print("\n" + "=" * 80)
     print("Доступные методы aggregate и update")
     print("=" * 80)
@@ -399,21 +406,14 @@ def print_methods_info():
 
 
 class DataLeakError(Exception):
-    """Обнаружена утечка данных."""
     pass
 
 
 class MetricMismatchError(Exception):
-    """Сохранённые метрики не совпадают с пересчитанными."""
     pass
 
 
 def diagnose_link_predictor(predictor, tolerance=1e-3):
-    """
-    Проверяет модель и пайплайн на утечки данных и корректность метрик.
-    Бросает исключения при критических проблемах.
-    Возвращает fig с диагностическими графиками и словарь с результатами.
-    """
     required_attrs = ['train_data', 'val_data', 'test_data', 'train_loader', 'val_loader',
                       'test_loader', 'model', 'device', 'test_fpr', 'test_auprc']
     for attr in required_attrs:

@@ -154,7 +154,7 @@ class LinkPredictor:
         lr: learning rate.
         weight_decay: коэффициент регуляризации.
         epochs: число эпох.
-        patience: терпение для ранней остановки.
+        patience: терпение для ранней остановки (по валидационному AUCPR).
     """
     def __init__(self, train_loader, val_loader, test_loader,
                  model_class, model_params,
@@ -172,7 +172,6 @@ class LinkPredictor:
         self.history = {'train_loss': [], 'val_loss': [],
                         'train_fpr': [], 'val_fpr': [],
                         'train_auprc': [], 'val_auprc': []}
-
 
     def _eval_loader(self, loader):
         """Возвращает FPR, AUCPR и средний loss для загрузчика."""
@@ -205,11 +204,12 @@ class LinkPredictor:
         return fpr, auprc, mean_loss
 
     def run(self):
-        """Запускает обучение, валидацию и тестирование. Возвращает модель, тестовые FPR и AUCPR."""
+        """Запускает обучение, валидацию и тестирование. Early stopping по AUCPR."""
         optimizer = torch.optim.Adam(self.model.parameters(), lr=self.lr, weight_decay=self.weight_decay)
-        best_val_fpr = 1.0
+        best_val_auprc = 0.0
         best_state = None
         patience_counter = 0
+
         for epoch in range(self.epochs):
             self.model.train()
             epoch_loss = 0.0
@@ -240,19 +240,19 @@ class LinkPredictor:
                       f"train_fpr={train_fpr:.4f}, val_fpr={val_fpr:.4f}, "
                       f"train_auprc={train_auprc:.4f}, val_auprc={val_auprc:.4f}")
 
-            if val_fpr < best_val_fpr:
-                best_val_fpr = val_fpr
+            if val_auprc > best_val_auprc:
+                best_val_auprc = val_auprc
                 best_state = deepcopy(self.model.state_dict())
                 patience_counter = 0
             else:
                 patience_counter += 1
                 if patience_counter >= self.patience:
-                    print(f"Early stopping at epoch {epoch}")
+                    print(f"Early stopping at epoch {epoch} (best val AUCPR = {best_val_auprc:.4f})")
                     break
 
         if best_state is not None:
             self.model.load_state_dict(best_state)
-            print(f"Best validation FPR: {best_val_fpr:.4f}")
+            print(f"Best validation AUCPR: {best_val_auprc:.4f}")
 
         test_fpr, test_auprc, _ = self._eval_loader(self.test_loader)
         print(f"Test FPR: {test_fpr:.4f}, Test AUCPR: {test_auprc:.4f}")
