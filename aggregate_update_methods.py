@@ -103,7 +103,8 @@ def _update_name(upd):
 
 def compare_all_combinations(train_loader, val_loader, test_loader,
                              train_data, val_data, test_data,
-                             results_file='comparison_results.csv', epochs=50,
+                             results_file='comparison_results.csv',
+                             epochs=50, lr=0.01, weight_decay=5e-4, patience=None,
                              hidden_dim=64, out_dim=64, dropout=0.3, num_layers=2,
                              attention_heads=4, **extra_model_params):
     aggregate_classes = [MeanMessage, SymNormMessage, ConvMessage, AttentionMessage]
@@ -113,6 +114,9 @@ def compare_all_combinations(train_loader, val_loader, test_loader,
     figs = {}
     diag_results = []
     in_dim = train_data.x.shape[1]
+
+    if patience is None:
+        patience = max(epochs // 3, 1)
 
     for AggClass in aggregate_classes:
         for UpdClass in update_classes:
@@ -162,7 +166,10 @@ def compare_all_combinations(train_loader, val_loader, test_loader,
                     test_loader=test_loader,
                     model_class=LinkPredictionMessagePassingModel,
                     model_params=model_params,
-                    epochs=epochs, patience=epochs // 3
+                    epochs=epochs,
+                    patience=patience,
+                    lr=lr,
+                    weight_decay=weight_decay
                 )
                 predictor.train_data = train_data
                 predictor.val_data = val_data
@@ -290,7 +297,8 @@ def plot_all_learning_curves(histories, save_path=None):
 
 def train_and_plot_all_combinations(train_loader, val_loader, test_loader,
                                     train_data, val_data, test_data,
-                                    epochs=30, save_dir='training_plots',
+                                    epochs=30, lr=0.01, weight_decay=5e-4, patience=None,
+                                    save_dir='training_plots',
                                     hidden_dim=64, out_dim=64, dropout=0.3, num_layers=2,
                                     attention_heads=4, **extra_model_params):
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -303,6 +311,9 @@ def train_and_plot_all_combinations(train_loader, val_loader, test_loader,
         train_data, val_data, test_data,
         results_file=f'{save_dir}/results.csv',
         epochs=epochs,
+        lr=lr,
+        weight_decay=weight_decay,
+        patience=patience,
         hidden_dim=hidden_dim,
         out_dim=out_dim,
         dropout=dropout,
