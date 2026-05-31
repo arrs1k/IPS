@@ -103,15 +103,16 @@ def _update_name(upd):
     }
     return mapping.get(cls, cls.__name__)
 
-
-def compare_all_combinations(data, results_file='comparison_results.csv', epochs=50):
+def compare_all_combinations(train_loader, val_loader, test_loader,
+                                 train_data, val_data, test_data,
+                                 results_file='comparison_results.csv', epochs=50):
     aggregate_classes = [MeanMessage, SymNormMessage, ConvMessage, AttentionMessage]
     update_classes = [SelfLoopUpdate, GRUUpdate]
     results = []
     histories = {}
     figs = {}
     diag_results = []
-    in_dim = data.x.shape[1]
+    in_dim = train_data.x.shape[1]
     hidden_dim = 64
     out_dim = 64
 
@@ -148,9 +149,17 @@ def compare_all_combinations(data, results_file='comparison_results.csv', epochs
 
             try:
                 predictor = LinkPredictor(
-                    data=data, model_class=LinkPredictionMessagePassingModel,
-                    model_params=model_params, epochs=epochs, patience=epochs // 3
+                    train_loader=train_loader,
+                    val_loader=val_loader,
+                    test_loader=test_loader,
+                    model_class=LinkPredictionMessagePassingModel,
+                    model_params=model_params,
+                    epochs=epochs, patience=epochs // 3
                 )
+                predictor.train_data = train_data
+                predictor.val_data = val_data
+                predictor.test_data = test_data
+
                 model, test_fpr, test_auprc = predictor.run()
                 best_val_fpr = min(predictor.history['val_fpr']) if predictor.history['val_fpr'] else 1.0
                 best_val_auprc = max(predictor.history['val_auprc']) if predictor.history['val_auprc'] else 0.0
@@ -273,17 +282,21 @@ def plot_all_learning_curves(histories, save_path=None):
         plt.savefig(save_path, dpi=150, bbox_inches='tight')
     plt.show()
 
-
-def train_and_plot_all_combinations(data, epochs=30, save_dir='training_plots'):
+def train_and_plot_all_combinations(train_loader, val_loader, test_loader,
+                                        train_data, val_data, test_data,
+                                        epochs=30, save_dir='training_plots'):
     """Обучает все комбинации, сохраняет результаты и графики."""
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     save_dir = f"{save_dir}_{timestamp}"
     os.makedirs(save_dir, exist_ok=True)
     print(f"\nРезультаты будут сохранены в: {save_dir}/")
 
-    df_results, histories, figs, diag_results = compare_all_combinations(data,
-                                                      results_file=f'{save_dir}/results.csv',
-                                                      epochs=epochs)
+    df_results, histories, figs, diag_results = compare_all_combinations(
+        train_loader, val_loader, test_loader,
+        train_data, val_data, test_data,
+        results_file=f'{save_dir}/results.csv',
+        epochs=epochs
+    )
     plot_all_learning_curves(histories, save_path=f'{save_dir}/learning_curves.png')
     plot_comparison_results(df_results, save_path=f'{save_dir}/comparison.png')
 

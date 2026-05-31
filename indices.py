@@ -2,6 +2,7 @@ import torch
 import numpy as np
 from scipy.sparse.linalg import spsolve
 from scipy.sparse import csr_matrix, eye, diags
+from torch_geometric.nn import APPNP
 from torch_geometric.utils import to_undirected
 
 

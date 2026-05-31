@@ -1,6 +1,7 @@
 import argparse
 import torch
 import pandas as pd
+import os
 from torch_geometric.data import Data
 from torch_geometric.transforms import RandomLinkSplit
 from torch_geometric.loader import LinkNeighborLoader
@@ -33,7 +34,7 @@ def collapse_transaction_vertices(G):
     return G
 
 
-def build_networkx_graph(df_in, df_out, collapse=False):
+def build_networkx_graph(df_in, df_out, collapse=True):
     bgm = BitcoinGraphMaker()
     G_nx = bgm.make_graph(df_in, df_out)
     if collapse:
@@ -56,46 +57,8 @@ def convert_to_pyg_data(G_nx):
     return data
 
 
-def add_transaction_weights(G, df_in, df_out):
-    for _, row in df_in.iterrows():
-        parts = row['trans'].strip().split('\t')
-        if len(parts) < 4:
-            continue
-        txHash = parts[1]
-        num_inputs = int(parts[2])
-        for i in range(num_inputs):
-            addr = parts[3 + 2*i]
-            amount = float(parts[4 + 2*i])
-            if G.has_edge(addr, txHash):
-                G[addr][txHash]['value'] = amount
-
-    for _, row in df_out.iterrows():
-        parts = row['trans'].strip().split('\t')
-        if len(parts) < 4:
-            continue
-        txHash = parts[1]
-        num_outputs = int(parts[2])
-        for i in range(num_outputs):
-            addr = parts[3 + 2*i]
-            amount = float(parts[4 + 2*i])
-            if G.has_edge(txHash, addr):
-                G[txHash][addr]['value'] = amount
-
-    return G
-
-
-def add_node_features(data):
-    num_nodes = data.num_nodes
-    in_deg = degree(data.edge_index[1], num_nodes=num_nodes, dtype=torch.float32)
-    out_deg = degree(data.edge_index[0], num_nodes=num_nodes, dtype=torch.float32)
-    data.x = torch.stack([in_deg, out_deg], dim=1)
-    return data
-
-
 def add_heuristic_node_features(data):
     num_nodes = data.num_nodes
-    edge_index = data.edge_index
-
     edges = data.edge_index
 
     in_deg = degree(edges[1], num_nodes=num_nodes, dtype=torch.float32)
@@ -110,68 +73,90 @@ def add_heuristic_node_features(data):
         count[count == 0] = 1.0
         return (aggregated / count).unsqueeze(1)
 
-    features = []
-    features.append(torch.stack([in_deg, out_deg], dim=1))
-
+    features = [torch.stack([in_deg, out_deg], dim=1)]
     features.append(mean_score_per_node(jaccard_scores))
     features.append(mean_score_per_node(adamic_adar_scores))
-    # features.append(mean_score_per_node(katz_scores))
-    # features.append(mean_score_per_node(personalized_pagerank_scores))
 
     data.x = torch.cat(features, dim=1)
     return data
 
 
-def save_data(data, path):
-    torch.save(data, path)
-
-
-def prepare_link_prediction_loaders(data, num_neighbors=[10, 5], batch_size=1024,
-                                    num_val=0.1, num_test=0.1, neg_sampling_ratio=1.0):
-    transform = RandomLinkSplit(
-        is_undirected=False,
-        num_val=num_val,
-        num_test=num_test,
-        neg_sampling_ratio=neg_sampling_ratio,
-    )
-    train_data, val_data, test_data = transform(data)
-
+def prepare_and_save_loaders(train_data, val_data, test_data, save_dir,
+                             num_neighbors, batch_size):
     train_loader = LinkNeighborLoader(
         train_data,
         num_neighbors=num_neighbors,
         batch_size=batch_size,
         edge_label_index=train_data.edge_label_index,
         edge_label=train_data.edge_label,
+        shuffle=True,
     )
-    return train_loader, val_data, test_data
+    val_loader = LinkNeighborLoader(
+        train_data,
+        num_neighbors=num_neighbors,
+        batch_size=batch_size,
+        edge_label_index=val_data.edge_label_index,
+        edge_label=val_data.edge_label,
+        shuffle=False,
+    )
+    test_loader = LinkNeighborLoader(
+        train_data,
+        num_neighbors=num_neighbors,
+        batch_size=batch_size,
+        edge_label_index=test_data.edge_label_index,
+        edge_label=test_data.edge_label,
+        shuffle=False,
+    )
+
+    save_path = os.path.join(save_dir, 'bitcoin_link_pred_data.pt')
+    torch.save({
+        'train_data': train_data,
+        'val_data': val_data,
+        'test_data': test_data,
+        'num_neighbors': num_neighbors,
+        'batch_size': batch_size,
+    }, save_path)
+    print(f"Данные и конфигурация загрузчиков сохранены в {save_path}")
+
+
+def main(args):
+    df_in, df_out = load_raw_data(args.in_file, args.out_file)
+    G_nx = build_networkx_graph(df_in, df_out, collapse=True)
+    data = convert_to_pyg_data(G_nx)
+
+    data.edge_index, data.edge_attr = remove_self_loops(data.edge_index, data.edge_attr)
+
+    transform = RandomLinkSplit(
+        is_undirected=False,
+        num_val=args.num_val,
+        num_test=args.num_test,
+        neg_sampling_ratio=args.neg_sampling_ratio,
+    )
+    train_data, val_data, test_data = transform(data)
+
+    train_data = add_heuristic_node_features(train_data)
+    val_data.x = train_data.x
+    test_data.x = train_data.x
+
+    prepare_and_save_loaders(train_data, val_data, test_data,
+                             save_dir=args.save_dir,
+                             num_neighbors=args.num_neighbors,
+                             batch_size=args.batch_size)
+
+    print(f"Граф загружен: {train_data.num_nodes} вершин, "
+          f"{train_data.edge_index.size(1)} тренировочных рёбер")
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Построение графа транзакций Bitcoin и подготовка данных для link prediction")
+    parser = argparse.ArgumentParser(description="Подготовка данных Bitcoin для link prediction")
     parser.add_argument("in_file")
     parser.add_argument("out_file")
-    parser.add_argument("--save", default="bitcoin_split.pt")
-    parser.add_argument("--collapse-transactions", action="store_true")
-    parser.add_argument("--remove-self-loops", action="store_true")
-    parser.add_argument("--use-heuristics", action="store_true")
+    parser.add_argument("--save-dir", default=".", help="Директория для сохранения")
+    parser.add_argument("--num-val", type=float, default=0.1)
+    parser.add_argument("--num-test", type=float, default=0.1)
+    parser.add_argument("--neg-sampling-ratio", type=float, default=1.0)
+    parser.add_argument("--batch-size", type=int, default=1024)
+    parser.add_argument("--num-neighbors", type=int, nargs='+', default=[10, 5])
+
     args = parser.parse_args()
-
-    df_in, df_out = load_raw_data(args.in_file, args.out_file)
-    G_nx = build_networkx_graph(df_in, df_out, collapse=args.collapse_transactions)
-
-    if not args.collapse_transactions:
-        G_nx = add_transaction_weights(G_nx, df_in, df_out)
-
-    data = convert_to_pyg_data(G_nx)
-
-    if args.use_heuristics:
-        data = add_heuristic_node_features(data)
-    else:
-        data = add_node_features(data)
-
-    if args.remove_self_loops:
-        data.edge_index, data.edge_attr = remove_self_loops(data.edge_index, data.edge_attr)
-
-    save_data(data, args.save)
-
-    print(f"Граф загружен: {data.num_nodes} вершин, {data.num_edges} рёбер")
+    main(args)

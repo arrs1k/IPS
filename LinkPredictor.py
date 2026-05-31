@@ -143,29 +143,27 @@ class LinkPredictionMessagePassingModel(nn.Module):
 
 class LinkPredictor:
     """
-    Пайплайн предсказания связей с оценкой FPR и AUCPR.
+    Пайплайн предсказания связей с использованием готовых загрузчиков.
 
     Параметры:
-        data: объект torch_geometric.data.Data.
+        train_loader: DataLoader для обучения.
+        val_loader: DataLoader для валидации.
+        test_loader: DataLoader для тестирования.
         model_class: класс модели.
-        model_params: словарь параметров модели.
-        val_ratio, test_ratio: доли рёбер для валидации и теста.
-        num_neighbors: список количества соседей для каждого уровня сэмплирования.
-        batch_size: размер батча.
-        neg_sampling_ratio: отношение негативных примеров к позитивным.
+        model_params: словарь параметров для инициализации модели.
         lr: learning rate.
         weight_decay: коэффициент регуляризации.
         epochs: число эпох.
         patience: терпение для ранней остановки.
     """
-    def __init__(self, data, model_class, model_params,
-                 val_ratio=0.1, test_ratio=0.1,
-                 num_neighbors=[10, 5], batch_size=128,
-                 neg_sampling_ratio=1.0,
+    def __init__(self, train_loader, val_loader, test_loader,
+                 model_class, model_params,
                  lr=0.01, weight_decay=5e-4,
                  epochs=200, patience=20):
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-        self._prepare_loaders(data, val_ratio, test_ratio, num_neighbors, batch_size, neg_sampling_ratio)
+        self.train_loader = train_loader
+        self.val_loader = val_loader
+        self.test_loader = test_loader
         self.model = model_class(**model_params).to(self.device)
         self.lr = lr
         self.weight_decay = weight_decay
@@ -175,41 +173,6 @@ class LinkPredictor:
                         'train_fpr': [], 'val_fpr': [],
                         'train_auprc': [], 'val_auprc': []}
 
-    def _prepare_loaders(self, data, val_ratio, test_ratio, num_neighbors, batch_size, neg_sampling_ratio):
-        transform = RandomLinkSplit(
-            num_val=val_ratio, num_test=test_ratio,
-            is_undirected=data.is_undirected(),
-            add_negative_train_samples=True,
-            neg_sampling_ratio=neg_sampling_ratio
-        )
-        train_data, val_data, test_data = transform(data)
-
-        self.train_loader = LinkNeighborLoader(
-            train_data, num_neighbors=num_neighbors,
-            edge_label_index=train_data.edge_label_index,
-            edge_label=train_data.edge_label,
-            batch_size=batch_size, shuffle=True, neg_sampling_ratio=0.0
-        )
-
-        self.val_loader = LinkNeighborLoader(
-            train_data,
-            num_neighbors=num_neighbors,
-            edge_label_index=val_data.edge_label_index,
-            edge_label=val_data.edge_label,
-            batch_size=batch_size, shuffle=False, neg_sampling_ratio=0.0
-        )
-
-        self.test_loader = LinkNeighborLoader(
-            train_data,
-            num_neighbors=num_neighbors,
-            edge_label_index=test_data.edge_label_index,
-            edge_label=test_data.edge_label,
-            batch_size=batch_size, shuffle=False, neg_sampling_ratio=0.0
-        )
-
-        self.train_data = train_data
-        self.val_data = val_data
-        self.test_data = test_data
 
     def _eval_loader(self, loader):
         """Возвращает FPR, AUCPR и средний loss для загрузчика."""
