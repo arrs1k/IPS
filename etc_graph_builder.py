@@ -1,9 +1,10 @@
+# etc_graph_builder.py
 import argparse
 import torch
 import pandas as pd
 import numpy as np
 import networkx as nx
-import matplotlib.pyplot as plt
+import os
 from torch_geometric.data import Data
 from torch_geometric.transforms import RandomLinkSplit
 from torch_geometric.loader import LinkNeighborLoader
@@ -11,6 +12,7 @@ from torch_geometric.utils import degree
 
 
 def load_ethereum_data(csv_path):
+    """Загружает и предобрабатывает данные транзакций Ethereum."""
     df = pd.read_csv(csv_path)
     if df['value'].dtype == 'object':
         df['value'] = pd.to_numeric(df['value'].astype(str).str.replace(',', ''), errors='coerce')
@@ -21,6 +23,7 @@ def load_ethereum_data(csv_path):
 
 
 def build_networkx_graph(df):
+    """Строит ориентированный граф NetworkX из DataFrame."""
     G = nx.DiGraph()
     grouped = df.groupby(['from_address', 'to_address']).agg({
         'value': ['sum', 'count']
@@ -39,6 +42,7 @@ def build_networkx_graph(df):
 
 
 def convert_to_pyg_data(G_nx):
+    """Конвертирует NetworkX граф в формат PyTorch Geometric."""
     nodes = list(G_nx.nodes())
     addr2idx = {addr: i for i, addr in enumerate(nodes)}
     edges = list(G_nx.edges(data='value'))
@@ -49,17 +53,17 @@ def convert_to_pyg_data(G_nx):
 
     src = [addr2idx[u] for u, v, w in edges]
     dst = [addr2idx[v] for u, v, w in edges]
-    weights = [w for u, v, w in edges]
+    weights = [w if w is not None else 0.0 for u, v, w in edges]
 
     edge_index = torch.tensor([src, dst], dtype=torch.long)
     edge_attr = torch.tensor(weights, dtype=torch.float32).unsqueeze(1)
 
-    # Явно указываем num_nodes для устранения предупреждения
     data = Data(edge_index=edge_index, edge_attr=edge_attr, num_nodes=len(nodes))
     return data
 
 
 def add_node_features(data):
+    """Добавляет признаки вершин на основе степеней."""
     num_nodes = data.num_nodes
 
     if data.num_edges == 0:
@@ -81,34 +85,54 @@ def add_node_features(data):
     return data
 
 
-def save_data(data, path):
-    torch.save(data, path)
-    print(f"Данные сохранены в {path}")
-
-
-def prepare_link_prediction_loaders(data, num_neighbors=[10, 5], batch_size=1024,
-                                    num_val=0.1, num_test=0.1, neg_sampling_ratio=1.0):
-    transform = RandomLinkSplit(
-        is_undirected=False,
-        num_val=num_val,
-        num_test=num_test,
-        neg_sampling_ratio=neg_sampling_ratio,
-    )
-    train_data, val_data, test_data = transform(data)
-
+def prepare_and_save_loaders(train_data, val_data, test_data, save_dir,
+                             num_neighbors, batch_size):
+    """
+    Создаёт загрузчики для обучения, валидации и тестирования,
+    и сохраняет их вместе с данными.
+    """
     train_loader = LinkNeighborLoader(
         train_data,
         num_neighbors=num_neighbors,
         batch_size=batch_size,
         edge_label_index=train_data.edge_label_index,
         edge_label=train_data.edge_label,
-        shuffle=True
+        shuffle=True,
+    )
+    val_loader = LinkNeighborLoader(
+        train_data,
+        num_neighbors=num_neighbors,
+        batch_size=batch_size,
+        edge_label_index=val_data.edge_label_index,
+        edge_label=val_data.edge_label,
+        shuffle=False,
+    )
+    test_loader = LinkNeighborLoader(
+        train_data,
+        num_neighbors=num_neighbors,
+        batch_size=batch_size,
+        edge_label_index=test_data.edge_label_index,
+        edge_label=test_data.edge_label,
+        shuffle=False,
     )
 
-    return train_loader, val_data, test_data
+    save_path = os.path.join(save_dir, 'ethereum_link_pred_data.pt')
+    torch.save({
+        'train_data': train_data,
+        'val_data': val_data,
+        'test_data': test_data,
+        'num_neighbors': num_neighbors,
+        'batch_size': batch_size,
+    }, save_path)
+    print(f"Данные и конфигурация загрузчиков сохранены в {save_path}")
+    
+    return train_loader, val_loader, test_loader
 
 
 def visualize_top_nodes_with_edges(G, top_n=50, max_edges=500, figsize=(14, 10)):
+    """Визуализирует топ узлов графа."""
+    import matplotlib.pyplot as plt
+    
     degrees = dict(G.degree())
     top_nodes = sorted(degrees.items(), key=lambda x: x[1], reverse=True)[:top_n]
     top_nodes_list = [node for node, deg in top_nodes]
@@ -180,18 +204,8 @@ def visualize_top_nodes_with_edges(G, top_n=50, max_edges=500, figsize=(14, 10))
     return subgraph
 
 
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser(
-        description="Построение графа транзакций Ethereum и подготовка данных для link prediction")
-    parser.add_argument("csv_file", help="Путь к CSV файлу с транзакциями Ethereum")
-    parser.add_argument("--save", default="ethereum_graph.pt", help="Имя файла для сохранения объекта Data")
-    parser.add_argument("--batch_size", type=int, default=1024, help="Размер батча")
-    parser.add_argument("--visualize", action="store_true", help="Визуализировать граф после построения")
-    parser.add_argument("--top_n", type=int, default=50, help="Количество топ узлов для визуализации")
-    parser.add_argument("--max_edges_viz", type=int, default=500, help="Максимальное количество рёбер на визуализации")
-
-    args = parser.parse_args()
-
+def main(args):
+    """Основная функция для подготовки данных Ethereum."""
     print(f"Загрузка данных из {args.csv_file}...")
     df = load_ethereum_data(args.csv_file)
     print(f"Загружено {len(df)} транзакций")
@@ -208,15 +222,55 @@ if __name__ == "__main__":
 
     print("Добавление признаков вершин...")
     data = add_node_features(data)
+    print(f"Размерность признаков: {data.x.shape[1]}")
 
-    print("Подготовка данных для link prediction...")
-    train_loader, val_data, test_data = prepare_link_prediction_loaders(data, batch_size=args.batch_size)
+    # Разделение данных на train/val/test
+    print("\nРазделение данных на train/val/test...")
+    transform = RandomLinkSplit(
+        is_undirected=False,
+        num_val=args.num_val,
+        num_test=args.num_test,
+        neg_sampling_ratio=args.neg_sampling_ratio,
+    )
+    train_data, val_data, test_data = transform(data)
 
-    save_data(data, args.save)
+    print(f"Train: {train_data.edge_index.shape[1]} рёбер")
+    print(f"Val: {val_data.edge_label_index.shape[1]} пар")
+    print(f"Test: {test_data.edge_label_index.shape[1]} пар")
 
-    print(f"\nИтоговый граф: {data.num_nodes} вершин, {data.num_edges} рёбер")
-    if hasattr(data, 'x') and data.x is not None:
-        print(f"Размерность признаков вершин: {data.x.shape[1]}")
+    # Создаём и сохраняем загрузчики
+    print("\nСоздание загрузчиков...")
+    train_loader, val_loader, test_loader = prepare_and_save_loaders(
+        train_data, val_data, test_data,
+        save_dir=args.save_dir,
+        num_neighbors=args.num_neighbors,
+        batch_size=args.batch_size
+    )
+
+    print(f"\nИтоговый граф: {train_data.num_nodes} вершин, "
+          f"{train_data.edge_index.shape[1]} тренировочных рёбер")
     print(f"Train батчей: {len(train_loader)}")
-    print(f"Validation рёбер: {val_data.edge_index.shape[1]}")
-    print(f"Test рёбер: {test_data.edge_index.shape[1]}")
+    print(f"Val батчей: {len(val_loader)}")
+    print(f"Test батчей: {len(test_loader)}")
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(
+        description="Построение графа транзакций Ethereum и подготовка данных для link prediction"
+    )
+    parser.add_argument("csv_file", help="Путь к CSV файлу с транзакциями Ethereum")
+    parser.add_argument("--save-dir", default=".", help="Директория для сохранения данных")
+    parser.add_argument("--num-val", type=float, default=0.1, help="Доля рёбер для валидации")
+    parser.add_argument("--num-test", type=float, default=0.1, help="Доля рёбер для теста")
+    parser.add_argument("--neg-sampling-ratio", type=float, default=1.0, 
+                        help="Отношение негативных примеров к позитивным")
+    parser.add_argument("--batch-size", type=int, default=1024, help="Размер батча")
+    parser.add_argument("--num-neighbors", type=int, nargs='+', default=[10, 5],
+                        help="Количество соседей для каждого уровня сэмплирования")
+    parser.add_argument("--visualize", action="store_true", help="Визуализировать граф после построения")
+    parser.add_argument("--top_n", type=int, default=50, help="Количество топ узлов для визуализации")
+    parser.add_argument("--max_edges_viz", type=int, default=500, 
+                        help="Максимальное количество рёбер на визуализации")
+
+    args = parser.parse_args()
+    main(args)

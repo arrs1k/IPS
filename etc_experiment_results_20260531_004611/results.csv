@@ -1,0 +1,11 @@
+aggregate,update,test_auc,error
+mean,self_loop,0,'NeighborSampler' requires either 'pyg-lib' or 'torch-sparse'
+mean,gru,0,'NeighborSampler' requires either 'pyg-lib' or 'torch-sparse'
+sym_norm,self_loop,0,'NeighborSampler' requires either 'pyg-lib' or 'torch-sparse'
+sym_norm,gru,0,'NeighborSampler' requires either 'pyg-lib' or 'torch-sparse'
+janossy,self_loop,0,'NeighborSampler' requires either 'pyg-lib' or 'torch-sparse'
+janossy,gru,0,'NeighborSampler' requires either 'pyg-lib' or 'torch-sparse'
+conv,self_loop,0,'NeighborSampler' requires either 'pyg-lib' or 'torch-sparse'
+conv,gru,0,'NeighborSampler' requires either 'pyg-lib' or 'torch-sparse'
+attention,self_loop,0,'NeighborSampler' requires either 'pyg-lib' or 'torch-sparse'
+attention,gru,0,'NeighborSampler' requires either 'pyg-lib' or 'torch-sparse'
