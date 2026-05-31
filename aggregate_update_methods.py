@@ -151,12 +151,12 @@ def compare_all_combinations(data, results_file='comparison_results.csv', epochs
                     data=data, model_class=LinkPredictionMessagePassingModel,
                     model_params=model_params, epochs=epochs, patience=epochs // 3
                 )
-                fig, diag = diagnose_link_predictor(predictor, tolerance=0.04)
-                figs[combo_name] = fig
-                diag_results.append(diag)
                 model, test_fpr, test_auprc = predictor.run()
                 best_val_fpr = min(predictor.history['val_fpr']) if predictor.history['val_fpr'] else 1.0
                 best_val_auprc = max(predictor.history['val_auprc']) if predictor.history['val_auprc'] else 0.0
+                fig, diag = diagnose_link_predictor(predictor, tolerance=0.04)
+                figs[combo_name] = fig
+                diag_results.append(diag)
                 res = {
                     'aggregate': AggClass.__name__,
                     'update': UpdClass.__name__,
