@@ -109,6 +109,8 @@ def compare_all_combinations(data, results_file='comparison_results.csv', epochs
     update_classes = [SelfLoopUpdate, GRUUpdate]
     results = []
     histories = {}
+    figs = {}
+    diag_results = []
     in_dim = data.x.shape[1]
     hidden_dim = 64
     out_dim = 64
@@ -149,6 +151,9 @@ def compare_all_combinations(data, results_file='comparison_results.csv', epochs
                     data=data, model_class=LinkPredictionMessagePassingModel,
                     model_params=model_params, epochs=epochs, patience=epochs // 3
                 )
+                fig, diag = diagnose_link_predictor(predictor, tolerance=0.04)
+                figs[combo_name] = fig
+                diag_results.append(diag)
                 model, test_fpr, test_auprc = predictor.run()
                 best_val_fpr = min(predictor.history['val_fpr']) if predictor.history['val_fpr'] else 1.0
                 best_val_auprc = max(predictor.history['val_auprc']) if predictor.history['val_auprc'] else 0.0
@@ -178,8 +183,7 @@ def compare_all_combinations(data, results_file='comparison_results.csv', epochs
     df_results = pd.DataFrame(results)
     df_results.to_csv(results_file, index=False)
     print(f"\nРезультаты сохранены в: {results_file}")
-    return df_results, histories
-
+    return df_results, histories, figs, diag_results
 
 def plot_comparison_results(results, save_path=None):
     """Визуализация результатов: столбчатая диаграмма FPR и тепловая карта AUCPR."""
@@ -277,11 +281,20 @@ def train_and_plot_all_combinations(data, epochs=30, save_dir='training_plots'):
     os.makedirs(save_dir, exist_ok=True)
     print(f"\nРезультаты будут сохранены в: {save_dir}/")
 
-    df_results, histories = compare_all_combinations(data,
+    df_results, histories, figs, diag_results = compare_all_combinations(data,
                                                       results_file=f'{save_dir}/results.csv',
                                                       epochs=epochs)
     plot_all_learning_curves(histories, save_path=f'{save_dir}/learning_curves.png')
     plot_comparison_results(df_results, save_path=f'{save_dir}/comparison.png')
+
+    diag_dir = os.path.join(save_dir, 'diagnostics')
+    os.makedirs(diag_dir, exist_ok=True)
+    for name, fig in figs.items():
+        if fig is not None:
+            path = os.path.join(diag_dir, f'{name}.png')
+            fig.savefig(path, dpi=150, bbox_inches='tight')
+            plt.close(fig)
+    print(f"Диагностические графики сохранены в: {diag_dir}")
 
     best_idx = df_results['test_auprc'].idxmax()
     best = df_results.loc[best_idx]
@@ -298,6 +311,8 @@ def train_and_plot_all_combinations(data, epochs=30, save_dir='training_plots'):
     for i, row in ranking.iterrows():
         print(f"   {i+1:2d}. {row['aggregate']:12} + {row['update']:12} : FPR={row['test_fpr']:.4f}, AUCPR={row['test_auprc']:.4f}")
     return df_results, histories
+
+
 
 
 def create_model_summary_table(df_results):
