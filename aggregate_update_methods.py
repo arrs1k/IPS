@@ -837,7 +837,7 @@ def run_with_optuna(train_loader, val_loader, test_loader,
                     trial.set_user_attr('best_val_auprc', best_val_auprc)
                     trial.set_user_attr('best_val_fpr', best_val_fpr)
                     
-                    score = best_val_auprc - best_val_fpr * 0.3
+                    score = best_val_auprc
                     
                     return score
                     
