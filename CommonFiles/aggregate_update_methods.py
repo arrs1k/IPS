@@ -550,9 +550,9 @@ def optimize_single_pair(train_loader, val_loader, test_loader,
         set_seed(trial_seed)
         
         params = {
-            'hidden_dim': trial.suggest_categorical('hidden_dim', [32, 64, 96, 128, 160, 192, 256]),
+            'hidden_dim': trial.suggest_categorical('hidden_dim', [32, 64, 96, 128]),
             'out_dim': trial.suggest_categorical('out_dim', [32, 48, 64, 96, 128]),
-            'num_layers': trial.suggest_int('num_layers', 1, 4),
+            'num_layers': trial.suggest_int('num_layers', 1, 6),
             'dropout': trial.suggest_float('dropout', 0.1, 0.6, step=0.05),
             'lr': trial.suggest_float('lr', 1e-4, 5e-3, log=True),
             'weight_decay': trial.suggest_float('weight_decay', 1e-5, 1e-2, log=True),
