@@ -4,7 +4,22 @@ import numpy as np
 import matplotlib.pyplot as plt
 from datetime import datetime
 import os
+import random
 from sklearn.metrics import average_precision_score, roc_auc_score
+
+
+def set_seed(seed=42):
+    """Фиксирует random state для воспроизводимости результатов."""
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+    os.environ['PYTHONHASHSEED'] = str(seed)
+    print(f"Random seed установлен на {seed}")
 
 
 class MeanMessage(nn.Module):
@@ -107,7 +122,9 @@ def compare_all_combinations(train_loader, val_loader, test_loader,
                              results_file='comparison_results.csv',
                              epochs=50, lr=0.01, weight_decay=5e-4, patience=None,
                              hidden_dim=64, out_dim=64, dropout=0.3, num_layers=2,
-                             attention_heads=4, **extra_model_params):
+                             attention_heads=4, seed=42, **extra_model_params):
+    set_seed(seed)
+    
     aggregate_classes = [MeanMessage, SymNormMessage, ConvMessage, AttentionMessage]
     update_classes = [SelfLoopUpdate, GRUUpdate]
     results = []
@@ -303,7 +320,9 @@ def train_and_plot_all_combinations(train_loader, val_loader, test_loader,
                                     epochs=30, lr=0.01, weight_decay=5e-4, patience=None,
                                     save_dir='training_plots',
                                     hidden_dim=64, out_dim=64, dropout=0.3, num_layers=2,
-                                    attention_heads=4, **extra_model_params):
+                                    attention_heads=4, seed=42, **extra_model_params):
+    set_seed(seed)
+    
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     save_dir = f"{save_dir}_{timestamp}"
     os.makedirs(save_dir, exist_ok=True)
@@ -322,6 +341,7 @@ def train_and_plot_all_combinations(train_loader, val_loader, test_loader,
         dropout=dropout,
         num_layers=num_layers,
         attention_heads=attention_heads,
+        seed=seed,
         **extra_model_params
     )
     plot_all_learning_curves(histories, save_path=f'{save_dir}/learning_curves.png')
@@ -504,12 +524,15 @@ def optimize_single_pair(train_loader, val_loader, test_loader,
                          aggregate_class, update_class,
                          n_trials=50, timeout=None,
                          save_dir='optuna_single',
-                         final_epochs=200):
+                         final_epochs=200,
+                         seed=42):
     try:
         import optuna
         from optuna.trial import Trial
     except ImportError:
         raise ImportError("Установите optuna: pip install optuna")
+    
+    set_seed(seed)
     
     combo_name = f"{aggregate_class.__name__}_{update_class.__name__}"
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -523,6 +546,9 @@ def optimize_single_pair(train_loader, val_loader, test_loader,
     in_dim = train_data.x.shape[1]
     
     def objective(trial: Trial):
+        trial_seed = seed + trial.number
+        set_seed(trial_seed)
+        
         params = {
             'hidden_dim': trial.suggest_categorical('hidden_dim', [32, 64, 96, 128, 160, 192, 256]),
             'out_dim': trial.suggest_categorical('out_dim', [32, 48, 64, 96, 128]),
@@ -612,7 +638,8 @@ def optimize_single_pair(train_loader, val_loader, test_loader,
         direction='maximize',
         study_name=study_name,
         storage=f'sqlite:///{save_dir}/{combo_name}.db',
-        load_if_exists=True
+        load_if_exists=True,
+        sampler=optuna.samplers.RandomSampler(seed=seed)
     )
     
     print(f"\nЗапуск оптимизации...")
@@ -634,6 +661,8 @@ def optimize_single_pair(train_loader, val_loader, test_loader,
     print("\n" + "=" * 80)
     print("ФИНАЛЬНОЕ ОБУЧЕНИЕ С ЛУЧШИМИ ПАРАМЕТРАМИ")
     print("=" * 80)
+    
+    set_seed(seed)
     
     if aggregate_class == AttentionMessage:
         attention_heads = best_params.get('attention_heads', 4)
@@ -730,12 +759,15 @@ def run_with_optuna(train_loader, val_loader, test_loader,
                     save_dir='optuna_results',
                     aggregate_class=None, update_class=None,
                     study_name=None,
-                    final_epochs=200):
+                    final_epochs=200,
+                    seed=42):
     try:
         import optuna
         from optuna.trial import Trial
     except ImportError:
         raise ImportError("Установите optuna: pip install optuna")
+    
+    set_seed(seed)
     
     aggregate_classes = [MeanMessage, SymNormMessage, ConvMessage, AttentionMessage]
     update_classes = [SelfLoopUpdate, GRUUpdate]
@@ -761,8 +793,11 @@ def run_with_optuna(train_loader, val_loader, test_loader,
             in_dim = train_data.x.shape[1]
             
             def objective(trial: Trial):
+                trial_seed = seed + trial.number
+                set_seed(trial_seed)
+                
                 params = {
-                    'hidden_dim': trial.suggest_categorical('hidden_dim', [32, 48,  64, 96, 128]),
+                    'hidden_dim': trial.suggest_categorical('hidden_dim', [32, 48, 64, 96, 128]),
                     'out_dim': trial.suggest_categorical('out_dim', [32, 48, 64, 96, 128]),
                     'num_layers': trial.suggest_int('num_layers', 1, 6),
                     'dropout': trial.suggest_float('dropout', 0.1, 0.6, step=0.05),
@@ -850,7 +885,8 @@ def run_with_optuna(train_loader, val_loader, test_loader,
                 direction='maximize',
                 study_name=study_name_current,
                 storage=f'sqlite:///{save_dir}/{combo_name}.db',
-                load_if_exists=True
+                load_if_exists=True,
+                sampler=optuna.samplers.RandomSampler(seed=seed)
             )
             
             print(f"\nЗапуск оптимизации для {combo_name}")
@@ -899,6 +935,8 @@ def run_with_optuna(train_loader, val_loader, test_loader,
     print("\n" + "=" * 80)
     print("ФИНАЛЬНОЕ ОБУЧЕНИЕ С ЛУЧШИМИ ГИПЕРПАРАМЕТРАМИ")
     print("=" * 80)
+    
+    set_seed(seed)
     
     final_results = {}
     final_histories = {}
@@ -953,7 +991,8 @@ def run_with_optuna(train_loader, val_loader, test_loader,
                 out_dim=best_params['out_dim'],
                 dropout=best_params['dropout'],
                 num_layers=best_params['num_layers'],
-                attention_heads=best_params.get('attention_heads', 4)
+                attention_heads=best_params.get('attention_heads', 4),
+                seed=seed
             )
             
             final_results[combo_name] = df_results
@@ -997,7 +1036,10 @@ def run_with_optuna(train_loader, val_loader, test_loader,
 def optimize_best_combination(train_loader, val_loader, test_loader,
                                train_data, val_data, test_data,
                                n_trials=100, timeout=None,
-                               save_dir='best_optimization'):
+                               save_dir='best_optimization',
+                               seed=42):
+    set_seed(seed)
+    
     print("=" * 80)
     print("ШАГ 1: ОПРЕДЕЛЕНИЕ ЛУЧШЕЙ КОМБИНАЦИИ МЕТОДОВ")
     print("=" * 80)
@@ -1009,7 +1051,8 @@ def optimize_best_combination(train_loader, val_loader, test_loader,
         hidden_dim=64,
         out_dim=64,
         dropout=0.3,
-        num_layers=2
+        num_layers=2,
+        seed=seed
     )
     
     best_idx = df_results['test_auprc'].idxmax()
@@ -1046,7 +1089,8 @@ def optimize_best_combination(train_loader, val_loader, test_loader,
         save_dir=save_dir,
         aggregate_class=best_agg_class,
         update_class=best_upd_class,
-        study_name=f"best_{best_aggregate_name}_{best_update_name}"
+        study_name=f"best_{best_aggregate_name}_{best_update_name}",
+        seed=seed
     )
     
     return results
@@ -1055,7 +1099,10 @@ def optimize_best_combination(train_loader, val_loader, test_loader,
 def run_optuna_for_all_combinations(train_loader, val_loader, test_loader,
                                      train_data, val_data, test_data,
                                      n_trials_per_combo=30, timeout=None,
-                                     save_dir='optuna_all_combinations'):
+                                     save_dir='optuna_all_combinations',
+                                     seed=42):
+    set_seed(seed)
+    
     aggregate_classes = [MeanMessage, SymNormMessage, ConvMessage, AttentionMessage]
     update_classes = [SelfLoopUpdate, GRUUpdate]
     
@@ -1071,7 +1118,8 @@ def run_optuna_for_all_combinations(train_loader, val_loader, test_loader,
                 save_dir=save_dir,
                 aggregate_class=AggClass,
                 update_class=UpdClass,
-                study_name=f"{AggClass.__name__}_{UpdClass.__name__}"
+                study_name=f"{AggClass.__name__}_{UpdClass.__name__}",
+                seed=seed
             )
             all_results.update(results)
     
