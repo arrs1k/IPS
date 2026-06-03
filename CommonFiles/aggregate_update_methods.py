@@ -301,43 +301,44 @@ def run_with_optuna(train_loader, val_loader, test_loader,
                     aggregate_class=None, update_method=None,
                     study_name=None,
                     final_epochs=200,
-                    seed=42):
+                    seed=42,
+                    use_mlp_decoder=True):
     set_seed(seed)
-    
+
     try:
         import optuna
         from optuna.trial import Trial
     except ImportError:
         raise ImportError("Установите optuna: pip install optuna")
-    
+
     aggregate_classes = [MeanMessage, SymNormMessage, ConvMessage, AttentionMessage]
     update_methods = ['self_loops', 'gru']
-    
+
     if aggregate_class is not None:
         aggregate_classes = [aggregate_class]
     if update_method is not None:
         update_methods = [update_method]
-    
+
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     save_dir = f"{save_dir}_{timestamp}"
     os.makedirs(save_dir, exist_ok=True)
-    
+
     all_best_params = {}
-    
+
     for AggClass in aggregate_classes:
         for upd_method in update_methods:
             combo_name = f"{AggClass.__name__}_{upd_method}"
             print("\n" + "=" * 80)
             print(f"OPTUNA ОПТИМИЗАЦИЯ ДЛЯ: {combo_name}")
             print("=" * 80)
-            
+
             in_dim = train_data.x.shape[1]
             num_edges = train_data.edge_index.size(1)
-            
+
             def objective(trial: Trial):
                 trial_seed = seed + trial.number
                 set_seed(trial_seed)
-                
+
                 params = {
                     'hidden_dim': trial.suggest_categorical('hidden_dim', [32, 48, 64, 96, 128]),
                     'out_dim': trial.suggest_categorical('out_dim', [32, 48, 64, 96, 128]),
@@ -347,10 +348,10 @@ def run_with_optuna(train_loader, val_loader, test_loader,
                     'weight_decay': trial.suggest_float('weight_decay', 1e-5, 1e-2, log=True),
                     'patience': trial.suggest_int('patience', 20, 80, step=10),
                 }
-                
+
                 if AggClass == AttentionMessage:
                     params['attention_heads'] = trial.suggest_categorical('attention_heads', [2, 4, 8])
-                
+
                 if AggClass == ConvMessage:
                     msg_list = [
                         ConvMessage(in_dim if i == 0 else params['hidden_dim'],
@@ -368,7 +369,7 @@ def run_with_optuna(train_loader, val_loader, test_loader,
                         AggClass(in_dim if i == 0 else params['hidden_dim'], params['hidden_dim'])
                         for i in range(params['num_layers'])
                     ]
-                
+
                 aggr_str = 'mean' if AggClass == MeanMessage else 'add'
                 model_params = {
                     'in_channels': in_dim,
@@ -380,8 +381,9 @@ def run_with_optuna(train_loader, val_loader, test_loader,
                     'update': upd_method,
                     'dropout': params['dropout'],
                 }
-                model_params = _with_mlp_decoder(model_params, params['out_dim'])
-                
+                if use_mlp_decoder:
+                    model_params = _with_mlp_decoder(model_params, params['out_dim'])
+
                 try:
                     predictor = LinkPredictor(
                         train_loader=train_loader,
@@ -409,27 +411,27 @@ def run_with_optuna(train_loader, val_loader, test_loader,
                 except Exception as e:
                     print(f"  Ошибка в trial: {e}")
                     return -1.0
-            
+
             study = optuna.create_study(
                 direction='maximize',
                 sampler=optuna.samplers.RandomSampler(seed=seed)
             )
-            
+
             print(f"\nЗапуск оптимизации для {combo_name}")
             print(f"Количество попыток: {n_trials}")
             study.optimize(objective, n_trials=n_trials, timeout=timeout, show_progress_bar=True)
-            
+
             best_params = study.best_params
             best_value = study.best_value
-            
+
             print(f"\nЛучшие гиперпараметры для {combo_name}:")
             for key, value in best_params.items():
                 print(f"  {key}: {value}")
             print(f"Лучшее значение метрики: {best_value:.4f}")
-            
+
             trials_df = study.trials_dataframe()
             trials_df.to_csv(f'{save_dir}/{combo_name}_trials.csv', index=False)
-            
+
             all_best_params[combo_name] = {
                 'best_params': best_params,
                 'best_value': best_value,
@@ -437,46 +439,46 @@ def run_with_optuna(train_loader, val_loader, test_loader,
                 'update_method': upd_method,
                 'in_dim': in_dim
             }
-    
+
     print("\n" + "=" * 80)
     print("ОПТИМИЗАЦИЯ ЗАВЕРШЕНА")
     print("=" * 80)
-    
+
     best_overall = None
     best_overall_value = -1
     for combo_name, result in all_best_params.items():
         if result['best_value'] > best_overall_value:
             best_overall_value = result['best_value']
             best_overall = (combo_name, result)
-    
+
     if best_overall:
         print(f"\nЛучшая комбинация: {best_overall[0]}")
         print(f"Лучшее значение метрики: {best_overall_value:.4f}")
         print("Лучшие гиперпараметры:")
         for key, value in best_overall[1]['best_params'].items():
             print(f"  {key}: {value}")
-    
+
     print("\n" + "=" * 80)
     print("ФИНАЛЬНОЕ ОБУЧЕНИЕ С ЛУЧШИМИ ГИПЕРПАРАМЕТРАМИ")
     print("=" * 80)
-    
+
     set_seed(seed)
-    
+
     final_results = {}
     final_histories = {}
-    
+
     for combo_name, result in all_best_params.items():
         AggClass = result['aggregate_class']
         upd_method = result['update_method']
         best_params = result['best_params']
         in_dim = result['in_dim']
         num_edges_final = train_data.edge_index.size(1)
-        
+
         print(f"\nФинальное обучение для: {combo_name}")
         print(f"Используемые параметры:")
         for key, value in best_params.items():
             print(f"  {key}: {value}")
-        
+
         if AggClass == ConvMessage:
             msg_list = [
                 ConvMessage(in_dim if i == 0 else best_params['hidden_dim'],
@@ -495,9 +497,9 @@ def run_with_optuna(train_loader, val_loader, test_loader,
                 AggClass(in_dim if i == 0 else best_params['hidden_dim'], best_params['hidden_dim'])
                 for i in range(best_params['num_layers'])
             ]
-        
+
         aggr_str = 'mean' if AggClass == MeanMessage else 'add'
-        
+
         try:
             df_results, histories, figs, diag_results = compare_all_combinations(
                 train_loader, val_loader, test_loader,
@@ -525,7 +527,7 @@ def run_with_optuna(train_loader, val_loader, test_loader,
             print(f"  Ошибка при финальном обучении: {e}")
             import traceback
             traceback.print_exc()
-    
+
     summary = []
     for combo_name, result in all_best_params.items():
         row = {
@@ -535,10 +537,10 @@ def run_with_optuna(train_loader, val_loader, test_loader,
         for key, value in result['best_params'].items():
             row[f'optuna_{key}'] = value
         summary.append(row)
-    
+
     summary_df = pd.DataFrame(summary)
     summary_df.to_csv(f'{save_dir}/best_params_summary.csv', index=False)
-    
+
     print("\n" + "=" * 80)
     print("ГОТОВО!")
     print("=" * 80)
@@ -546,59 +548,5 @@ def run_with_optuna(train_loader, val_loader, test_loader,
     print("  - best_params_summary.csv - лучшие параметры для каждой комбинации")
     print("  - final_*_results.csv - результаты финального обучения")
     print("  - *_trials.csv - все попытки оптимизации")
-    
-    return all_best_params, final_results, final_histories
 
-def run_optuna_for_all_combinations(train_loader, val_loader, test_loader,
-                                     train_data, val_data, test_data,
-                                     n_trials_per_combo=30, timeout=None,
-                                     save_dir='optuna_all_combinations',
-                                     seed=42):
-    set_seed(seed)
-    
-    aggregate_classes = [MeanMessage, SymNormMessage, ConvMessage, AttentionMessage]
-    update_methods = ['self_loops', 'gru']
-    all_results = {}
-    
-    for AggClass in aggregate_classes:
-        for upd_method in update_methods:
-            results = run_with_optuna(
-                train_loader, val_loader, test_loader,
-                train_data, val_data, test_data,
-                n_trials=n_trials_per_combo,
-                timeout=timeout,
-                save_dir=save_dir,
-                aggregate_class=AggClass,
-                update_method=upd_method,
-                study_name=f"{AggClass.__name__}_{upd_method}",
-                seed=seed
-            )
-            all_results.update(results)
-    
-    print("\n" + "=" * 80)
-    print("СРАВНЕНИЕ ОПТИМИЗИРОВАННЫХ КОМБИНАЦИЙ")
-    print("=" * 80)
-    
-    comparison = []
-    for combo_name, result in all_results.items():
-        if isinstance(result, dict) and 'best_value' in result:
-            comparison.append({
-                'Комбинация': combo_name,
-                'Test AUCPR': result['best_value'],
-                'hidden_dim': result['best_params'].get('hidden_dim'),
-                'out_dim': result['best_params'].get('out_dim'),
-                'num_layers': result['best_params'].get('num_layers'),
-                'dropout': result['best_params'].get('dropout'),
-                'lr': result['best_params'].get('lr'),
-                'weight_decay': result['best_params'].get('weight_decay'),
-            })
-    
-    if comparison:
-        comparison_df = pd.DataFrame(comparison)
-        comparison_df = comparison_df.sort_values('Test AUCPR', ascending=False)
-        comparison_df.to_csv(f'{save_dir}/comparison.csv', index=False)
-        print("\nРейтинг оптимизированных комбинаций:")
-        for i, row in comparison_df.iterrows():
-            print(f"  {i+1}. {row['комбинация']}: {row['Test AUCPR']:.4f}")
-    
-    return all_results
+    return all_best_params, final_results, final_histories
