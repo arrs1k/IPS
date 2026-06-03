@@ -12,33 +12,41 @@ from torch_geometric.utils import degree, softmax
 
 
 class CustomMessagePassingLayer(MessagePassing):
-    """
-    Гибкий слой передачи сообщений.
-
-    Параметры:
-        in_dim: входная размерность признаков узлов.
-        out_dim: выходная размерность.
-        message_fn: функция сообщения (принимает x_j, x_i, edge_attr, index).
-        aggr: тип агрегации ('add', 'mean', 'max' или объект Aggregation).
-        update_fn: функция обновления (принимает aggr_out, x).
-    """
-    def __init__(self, in_dim, out_dim, message_fn=None, aggr='add', update_fn=None):
+    def __init__(self, in_dim, out_dim, message_fn=None, aggr='add',
+                 self_loops=True, use_gru=False):
         super().__init__(aggr=aggr)
         self.in_dim = in_dim
         self.out_dim = out_dim
+        self.self_loops = self_loops
+        self.use_gru = use_gru
+
         if message_fn is None:
             self.message_lin = nn.Linear(in_dim, out_dim, bias=False)
             self._custom_message = False
         else:
             self._custom_message = True
             self.message_fn = message_fn
-        if update_fn is None:
-            self._custom_update = False
-        else:
-            self._custom_update = True
-            self.update_fn = update_fn
+
+        if self.use_gru:
+            self.proj = nn.Linear(in_dim, out_dim) if in_dim != out_dim else nn.Identity()
+            self.gru_cell = nn.GRUCell(out_dim, out_dim)
 
     def forward(self, x, edge_index, edge_attr=None):
+        if self.self_loops:
+            num_nodes = x.size(0)
+            loop_index = torch.arange(0, num_nodes, device=edge_index.device).unsqueeze(0).repeat(2, 1)
+            edge_index = torch.cat([edge_index, loop_index], dim=1)
+            if edge_attr is not None:
+                loop_attr = torch.zeros(num_nodes, edge_attr.size(1), device=edge_attr.device)
+                edge_attr = torch.cat([edge_attr, loop_attr], dim=0)
+
+        if self._custom_message and getattr(self.message_fn, 'is_sym_norm', False):
+            row, col = edge_index
+            deg = degree(col, x.size(0), dtype=x.dtype)
+            deg_inv_sqrt = deg.pow(-0.5)
+            deg_inv_sqrt[deg_inv_sqrt == float('inf')] = 0
+            edge_attr = (deg_inv_sqrt[row] * deg_inv_sqrt[col]).unsqueeze(-1)
+
         return self.propagate(edge_index, x=x, edge_attr=edge_attr, index=edge_index[1])
 
     def message(self, x_i, x_j, edge_attr=None, index=None):
@@ -47,82 +55,55 @@ class CustomMessagePassingLayer(MessagePassing):
         return self.message_lin(x_j)
 
     def update(self, aggr_out, x):
-        if self._custom_update:
-            return self.update_fn(aggr_out, x)
+        if self.use_gru:
+            x_proj = self.proj(x)
+            return self.gru_cell(aggr_out, x_proj)
         return aggr_out
 
 
 class LinkPredictionMessagePassingModel(nn.Module):
-    """
-    Модель предсказания связей на основе message passing.
-
-    Параметры:
-        in_channels: размерность входных признаков.
-        hidden_channels: размерность скрытых слоёв.
-        out_channels: размерность выходных эмбеддингов.
-        num_layers: количество слоёв.
-        message_fn: список message-функций для каждого слоя.
-        aggr: строка или объект агрегации.
-        update_fn: список update-функций для каждого слоя.
-        decoder_fn: функция декодирования (по умолчанию скалярное произведение).
-        dropout: вероятность dropout.
-    """
     def __init__(self, in_channels, hidden_channels=64, out_channels=64, num_layers=2,
-                 message_fn=None, aggr='add', update_fn=None,
+                 message_fn=None, aggr='add', update='self_loops',
                  decoder_fn=None, dropout=0.0):
         super().__init__()
-        if decoder_fn is None:
-            self.decoder_fn = self.default_decoder
-        else:
-            self.decoder_fn = decoder_fn
+        self.decoder_fn = decoder_fn if decoder_fn is not None else self.default_decoder
         self.dropout = dropout
         self.num_layers = num_layers
-
         if isinstance(hidden_channels, int):
             hidden_channels = [hidden_channels] * num_layers
-
         if message_fn is None:
             message_fn = [None] * num_layers
         elif not isinstance(message_fn, (list, tuple)):
             message_fn = [message_fn] * num_layers
-
-        if update_fn is None:
-            update_fn = [None] * num_layers
-        elif not isinstance(update_fn, (list, tuple)):
-            update_fn = [update_fn] * num_layers
-
         self.layers = nn.ModuleList()
         self.norms = nn.ModuleList()
-
-        self.layers.append(
-            CustomMessagePassingLayer(in_channels, hidden_channels[0],
-                                      message_fn=message_fn[0], aggr=aggr,
-                                      update_fn=update_fn[0])
-        )
-        self.norms.append(nn.LayerNorm(hidden_channels[0]))
-
-        for i in range(num_layers - 1):
-            self.layers.append(
-                CustomMessagePassingLayer(hidden_channels[i], hidden_channels[i + 1],
-                                          message_fn=message_fn[i + 1], aggr=aggr,
-                                          update_fn=update_fn[i + 1])
+        for i in range(num_layers):
+            in_dim = in_channels if i == 0 else hidden_channels[i - 1]
+            out_dim = hidden_channels[i]
+            use_self_loops = not getattr(message_fn[i], 'is_conv', False) if message_fn[i] is not None else True
+            use_gru = (update == 'gru')
+            layer = CustomMessagePassingLayer(
+                in_dim, out_dim,
+                message_fn=message_fn[i],
+                aggr=aggr,
+                self_loops=use_self_loops,
+                use_gru=use_gru
             )
-            self.norms.append(nn.LayerNorm(hidden_channels[i + 1]))
-
+            self.layers.append(layer)
+            self.norms.append(nn.LayerNorm(out_dim))
         self.proj = nn.Linear(hidden_channels[-1], out_channels)
 
     def default_decoder(self, z, edge_label_index):
         row, col = edge_label_index
         return (z[row] * z[col]).sum(dim=-1)
 
-    def encode(self, x, edge_index, edge_attr=None):
+    def encode(self, x, edge_index, edge_id=None):
         for i, (layer, norm) in enumerate(zip(self.layers, self.norms)):
-            if hasattr(layer, 'message_fn') and getattr(layer.message_fn, 'is_sym_norm', False):
-                row, col = edge_index
-                deg = degree(col, x.size(0), dtype=x.dtype)
-                deg_inv_sqrt = deg.pow(-0.5)
-                deg_inv_sqrt[deg_inv_sqrt == float('inf')] = 0
-                edge_attr = (deg_inv_sqrt[row] * deg_inv_sqrt[col]).unsqueeze(-1)
+            if hasattr(layer, 'message_fn') and layer.message_fn is not None:
+                if getattr(layer.message_fn, 'is_conv', False):
+                    edge_attr = edge_id.unsqueeze(-1).float()
+                else:
+                    edge_attr = None
             else:
                 edge_attr = None
             x = layer(x, edge_index, edge_attr)
@@ -136,26 +117,12 @@ class LinkPredictionMessagePassingModel(nn.Module):
     def decode(self, z, edge_label_index):
         return self.decoder_fn(z, edge_label_index)
 
-    def forward(self, x, edge_index, edge_label_index, edge_attr=None):
-        z = self.encode(x, edge_index, edge_attr)
+    def forward(self, x, edge_index, edge_label_index, edge_attr=None, edge_id=None):
+        z = self.encode(x, edge_index, edge_id)
         return self.decode(z, edge_label_index)
 
 
 class LinkPredictor:
-    """
-    Пайплайн предсказания связей с использованием готовых загрузчиков.
-
-    Параметры:
-        train_loader: DataLoader для обучения.
-        val_loader: DataLoader для валидации.
-        test_loader: DataLoader для тестирования.
-        model_class: класс модели.
-        model_params: словарь параметров для инициализации модели.
-        lr: learning rate.
-        weight_decay: коэффициент регуляризации.
-        epochs: число эпох.
-        patience: терпение для ранней остановки (по валидационному AUCPR).
-    """
     def __init__(self, train_loader, val_loader, test_loader,
                  model_class, model_params,
                  lr=0.01, weight_decay=5e-4,
@@ -174,7 +141,6 @@ class LinkPredictor:
                         'train_auprc': [], 'val_auprc': []}
 
     def _eval_loader(self, loader):
-        """Возвращает FPR, AUCPR и средний loss для загрузчика."""
         self.model.eval()
         all_probs, all_labels = [], []
         total_loss = 0.0
@@ -182,7 +148,8 @@ class LinkPredictor:
         with torch.no_grad():
             for batch in loader:
                 batch = batch.to(self.device)
-                logits = self.model(batch.x, batch.edge_index, batch.edge_label_index)
+                edge_id = getattr(batch, 'edge_id', None)
+                logits = self.model(batch.x, batch.edge_index, batch.edge_label_index, edge_id=edge_id)
                 loss = F.binary_cross_entropy_with_logits(logits, batch.edge_label)
                 total_loss += loss.item() * batch.edge_label.size(0)
                 total_samples += batch.edge_label.size(0)
@@ -204,7 +171,6 @@ class LinkPredictor:
         return fpr, auprc, mean_loss
 
     def run(self):
-        """Запускает обучение, валидацию и тестирование. Early stopping по AUCPR."""
         optimizer = torch.optim.Adam(self.model.parameters(), lr=self.lr, weight_decay=self.weight_decay)
         best_val_auprc = 0.0
         best_state = None
@@ -216,8 +182,9 @@ class LinkPredictor:
             batches = 0
             for batch in self.train_loader:
                 batch = batch.to(self.device)
+                edge_id = getattr(batch, 'edge_id', None)
                 optimizer.zero_grad()
-                logits = self.model(batch.x, batch.edge_index, batch.edge_label_index)
+                logits = self.model(batch.x, batch.edge_index, batch.edge_label_index, edge_id=edge_id)
                 loss = F.binary_cross_entropy_with_logits(logits, batch.edge_label)
                 loss.backward()
                 optimizer.step()
@@ -263,7 +230,6 @@ class LinkPredictor:
         return self.model, test_fpr, test_auprc
 
     def plot_learning_curves(self):
-        """Рисует кривые обучения: FPR и AUCPR."""
         epochs = range(1, len(self.history['train_fpr']) + 1)
         plt.figure(figsize=(12, 5))
         plt.subplot(1, 2, 1)
@@ -287,13 +253,13 @@ class LinkPredictor:
         plt.show()
 
     def plot_test_pr_curve(self):
-        """Строит Precision-Recall кривую для тестового набора."""
         self.model.eval()
         all_probs, all_labels = [], []
         with torch.no_grad():
             for batch in self.test_loader:
                 batch = batch.to(self.device)
-                logits = self.model(batch.x, batch.edge_index, batch.edge_label_index)
+                edge_id = getattr(batch, 'edge_id', None)
+                logits = self.model(batch.x, batch.edge_index, batch.edge_label_index, edge_id=edge_id)
                 probs = torch.sigmoid(logits).cpu()
                 all_probs.append(probs)
                 all_labels.append(batch.edge_label.cpu())

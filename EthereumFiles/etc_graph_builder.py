@@ -1,14 +1,13 @@
 import argparse
 import torch
 import pandas as pd
-import numpy as np
 import networkx as nx
 import os
 from torch_geometric.data import Data
 from torch_geometric.transforms import RandomLinkSplit
 from torch_geometric.loader import LinkNeighborLoader
 from torch_geometric.utils import degree, remove_self_loops
-from indices import jaccard_scores, adamic_adar_scores, katz_scores, personalized_pagerank_scores
+from CommonFiles.indices import jaccard_scores, adamic_adar_scores
 
 
 def load_ethereum_data(csv_path):

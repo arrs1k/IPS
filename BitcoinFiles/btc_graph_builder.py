@@ -1,162 +1,145 @@
 import argparse
-import torch
-import pandas as pd
 import os
+from collections import defaultdict
+
+import pandas as pd
+import torch
 from torch_geometric.data import Data
 from torch_geometric.transforms import RandomLinkSplit
-from torch_geometric.loader import LinkNeighborLoader
 from torch_geometric.utils import degree, remove_self_loops
+
 from chartalist.common.bitcoin_graph_maker import BitcoinGraphMaker
-from indices import jaccard_scores, katz_scores, adamic_adar_scores, personalized_pagerank_scores
 
 
 def load_raw_data(in_path, out_path):
-    with open(in_path, 'r') as f:
-        lines_in = [line.strip() for line in f if line.strip()]
-    with open(out_path, 'r') as f:
-        lines_out = [line.strip() for line in f if line.strip()]
-
-    df_in = pd.DataFrame({'trans': lines_in})
-    df_out = pd.DataFrame({'trans': lines_out})
+    df_in = pd.DataFrame({'trans': pd.read_csv(in_path, header=None, names=['trans'])['trans'].astype(str).str.strip()})
+    df_out = pd.DataFrame({'trans': pd.read_csv(out_path, header=None, names=['trans'])['trans'].astype(str).str.strip()})
+    df_in = df_in[df_in['trans'] != '']
+    df_out = df_out[df_out['trans'] != '']
     return df_in, df_out
 
 
 def collapse_transaction_vertices(G):
-    tx_nodes = [node for node, attr in G.nodes(data=True) if attr.get('type') == 'trans']
-    for tx in tx_nodes:
-        in_edges = list(G.in_edges(tx))
-        out_edges = list(G.out_edges(tx))
-        for u, _ in in_edges:
-            for _, v in out_edges:
-                if not G.has_edge(u, v):
-                    G.add_edge(u, v, value=1.0)
-        G.remove_node(tx)
+    add = defaultdict(float)
+    rem = []
+    for tx, attr in G.nodes(data=True):
+        if attr.get('type') != 'trans':
+            continue
+        ins = [u for u, _ in G.in_edges(tx)]
+        outs = [v for _, v in G.out_edges(tx)]
+        for u in ins:
+            wu = G[u][tx].get('value', 1.0) or 1.0
+            for v in outs:
+                wv = G[tx][v].get('value', 1.0) or 1.0
+                add[(u, v)] += min(wu, wv)
+        rem.append(tx)
+    for (u, v), w in add.items():
+        if G.has_edge(u, v):
+            G[u][v]['value'] = float((G[u][v].get('value', 0.0) or 0.0) + w)
+        else:
+            G.add_edge(u, v, value=float(w))
+    G.remove_nodes_from(rem)
     return G
 
 
 def build_networkx_graph(df_in, df_out, collapse=True):
-    bgm = BitcoinGraphMaker()
-    G_nx = bgm.make_graph(df_in, df_out)
-    if collapse:
-        G_nx = collapse_transaction_vertices(G_nx)
-    return G_nx
+    G = BitcoinGraphMaker().make_graph(df_in, df_out)
+    return collapse_transaction_vertices(G) if collapse else G
 
 
-def convert_to_pyg_data(G_nx):
-    nodes = list(G_nx.nodes())
-    addr2idx = {addr: i for i, addr in enumerate(nodes)}
-
-    edges = list(G_nx.edges(data='value'))
-    src = [addr2idx[u] for u, v, w in edges]
-    dst = [addr2idx[v] for u, v, w in edges]
-    weights = [w if w is not None else 0.0 for u, v, w in edges]
-
-    edge_index = torch.tensor([src, dst], dtype=torch.long)
-    edge_attr = torch.tensor(weights, dtype=torch.float32).unsqueeze(1)
-    data = Data(edge_index=edge_index, edge_attr=edge_attr)
-    return data
+def convert_to_pyg_data(G):
+    nodes = list(G.nodes())
+    idx = {n: i for i, n in enumerate(nodes)}
+    e = list(G.edges(data=True))
+    edge_index = torch.tensor([[idx[u] for u, v, _ in e], [idx[v] for u, v, _ in e]], dtype=torch.long)
+    edge_attr = torch.tensor([float(d.get('value', 0.0) or 0.0) for _, _, d in e], dtype=torch.float32).unsqueeze(1)
+    return Data(edge_index=edge_index, edge_attr=edge_attr, num_nodes=len(nodes))
 
 
 def add_heuristic_node_features(data):
-    num_nodes = data.num_nodes
-    edges = data.edge_index
+    n, ei, ew = data.num_nodes, data.edge_index, data.edge_attr.view(-1)
+    src, dst = ei[0], ei[1]
+    in_deg = degree(dst, n, dtype=torch.float32)
+    out_deg = degree(src, n, dtype=torch.float32)
+    in_sum = torch.zeros(n, dtype=torch.float32).scatter_add_(0, dst, ew)
+    out_sum = torch.zeros(n, dtype=torch.float32).scatter_add_(0, src, ew)
+    in_mean = in_sum / in_deg.clamp_min(1)
+    out_mean = out_sum / out_deg.clamp_min(1)
 
-    in_deg = degree(edges[1], num_nodes=num_nodes, dtype=torch.float32)
-    out_deg = degree(edges[0], num_nodes=num_nodes, dtype=torch.float32)
+    g = Data(edge_index=ei, num_nodes=n)
 
-    def mean_score_per_node(score_func):
-        scores = score_func(Data(edge_index=edges, num_nodes=num_nodes), edge_label_index=edges)
-        aggregated = torch.zeros(num_nodes, dtype=torch.float32)
-        count = torch.zeros(num_nodes, dtype=torch.float32)
-        aggregated = aggregated.scatter_add(0, edges[0], scores)
-        count = count.scatter_add(0, edges[0], torch.ones_like(scores))
-        count[count == 0] = 1.0
-        return (aggregated / count).unsqueeze(1)
+    def mean_score_per_node(score_fn):
+        s = score_fn(g, edge_label_index=ei).float()
+        a = torch.zeros(n, dtype=torch.float32).scatter_add_(0, src, s)
+        c = torch.zeros(n, dtype=torch.float32).scatter_add_(0, src, torch.ones_like(s))
+        return (a / c.clamp_min(1)).unsqueeze(1)
 
-    features = [torch.stack([in_deg, out_deg], dim=1)]
-    features.append(mean_score_per_node(jaccard_scores))
-    features.append(mean_score_per_node(adamic_adar_scores))
-
-    data.x = torch.cat(features, dim=1)
+    x = torch.stack([
+        torch.log1p(in_deg),
+        torch.log1p(out_deg),
+        torch.log1p(in_sum),
+        torch.log1p(out_sum),
+        torch.log1p(in_mean),
+        torch.log1p(out_mean),
+    ], dim=1)
+    # data.x = torch.cat([x, mean_score_per_node(jaccard_scores), mean_score_per_node(adamic_adar_scores)], dim=1)
+    data.x = torch.cat([x], dim=1)
     return data
 
 
-def prepare_and_save_loaders(train_data, val_data, test_data, save_dir,
-                             num_neighbors, batch_size):
-    train_loader = LinkNeighborLoader(
-        train_data,
-        num_neighbors=num_neighbors,
-        batch_size=batch_size,
-        edge_label_index=train_data.edge_label_index,
-        edge_label=train_data.edge_label,
-        shuffle=True,
-    )
-    val_loader = LinkNeighborLoader(
-        train_data,
-        num_neighbors=num_neighbors,
-        batch_size=batch_size,
-        edge_label_index=val_data.edge_label_index,
-        edge_label=val_data.edge_label,
-        shuffle=False,
-    )
-    test_loader = LinkNeighborLoader(
-        train_data,
-        num_neighbors=num_neighbors,
-        batch_size=batch_size,
-        edge_label_index=test_data.edge_label_index,
-        edge_label=test_data.edge_label,
-        shuffle=False,
-    )
-
-    save_path = os.path.join(save_dir, 'bitcoin_link_pred_data.pt')
-    torch.save({
-        'train_data': train_data,
-        'val_data': val_data,
-        'test_data': test_data,
-        'num_neighbors': num_neighbors,
-        'batch_size': batch_size,
-    }, save_path)
-    print(f"Данные и конфигурация загрузчиков сохранены в {save_path}")
-
-
 def main(args):
+    print('load_raw_data...')
     df_in, df_out = load_raw_data(args.in_file, args.out_file)
-    G_nx = build_networkx_graph(df_in, df_out, collapse=True)
-    data = convert_to_pyg_data(G_nx)
+    print('raw loaded', len(df_in), len(df_out))
 
+    print('build_networkx_graph...')
+    G = build_networkx_graph(df_in, df_out, collapse=True)
+    print('graph built', G.number_of_nodes(), G.number_of_edges())
+
+    print('convert_to_pyg_data...')
+    data = convert_to_pyg_data(G)
+    print('pyg converted', data.num_nodes, data.edge_index.size(1))
+
+    print('remove_self_loops...')
     data.edge_index, data.edge_attr = remove_self_loops(data.edge_index, data.edge_attr)
+    print('self loops removed', data.edge_index.size(1))
 
-    transform = RandomLinkSplit(
+    print('RandomLinkSplit...')
+    train_data, val_data, test_data = RandomLinkSplit(
         is_undirected=False,
         num_val=args.num_val,
         num_test=args.num_test,
         neg_sampling_ratio=args.neg_sampling_ratio,
-    )
-    train_data, val_data, test_data = transform(data)
+    )(data)
+    print('split done')
 
+    print('add_heuristic_node_features...')
     train_data = add_heuristic_node_features(train_data)
+    print('features done')
+
     val_data.x = train_data.x
     test_data.x = train_data.x
 
-    prepare_and_save_loaders(train_data, val_data, test_data,
-                             save_dir=args.save_dir,
-                             num_neighbors=args.num_neighbors,
-                             batch_size=args.batch_size)
-
-    print(f"Граф загружен: {train_data.num_nodes} вершин, "
-          f"{train_data.edge_index.size(1)} тренировочных рёбер")
+    path = os.path.join(args.save_dir, 'bitcoin_link_pred_data.pt')
+    print('saving...')
+    torch.save({
+        'train_data': train_data,
+        'val_data': val_data,
+        'test_data': test_data,
+        'num_neighbors': args.num_neighbors,
+        'batch_size': args.batch_size,
+    }, path)
+    print(f'Данные сохранены в {path}')
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Подготовка данных Bitcoin для link prediction")
-    parser.add_argument("in_file")
-    parser.add_argument("out_file")
-    parser.add_argument("--save-dir", default=".", help="Директория для сохранения")
-    parser.add_argument("--num-val", type=float, default=0.1)
-    parser.add_argument("--num-test", type=float, default=0.1)
-    parser.add_argument("--neg-sampling-ratio", type=float, default=1.0)
-    parser.add_argument("--batch-size", type=int, default=1024)
-    parser.add_argument("--num-neighbors", type=int, nargs='+', default=[10, 5])
-
-    args = parser.parse_args()
-    main(args)
+    p = argparse.ArgumentParser(description="Подготовка данных Bitcoin для link prediction")
+    p.add_argument("in_file")
+    p.add_argument("out_file")
+    p.add_argument("--save-dir", default=".")
+    p.add_argument("--num-val", type=float, default=0.1)
+    p.add_argument("--num-test", type=float, default=0.1)
+    p.add_argument("--neg-sampling-ratio", type=float, default=1.0)
+    p.add_argument("--batch-size", type=int, default=1024)
+    p.add_argument("--num-neighbors", type=int, nargs='+', default=[10, 5])
+    main(p.parse_args())

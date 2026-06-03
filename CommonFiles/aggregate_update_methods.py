@@ -4,52 +4,53 @@ import numpy as np
 import matplotlib.pyplot as plt
 from datetime import datetime
 import os
-import random
 from sklearn.metrics import average_precision_score, roc_auc_score
+from torch_geometric.utils import softmax
 
-
-def set_seed(seed=42):
-    """Фиксирует random state для воспроизводимости результатов."""
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed(seed)
-        torch.cuda.manual_seed_all(seed)
-    torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.benchmark = False
-    os.environ['PYTHONHASHSEED'] = str(seed)
-    print(f"Random seed установлен на {seed}")
-
+class MLPDecoder(nn.Module):
+    def __init__(self, emb_dim, hidden_dim=128, dropout=0.2):
+        super().__init__()
+        self.mlp = nn.Sequential(
+            nn.Linear(emb_dim * 4, hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, hidden_dim // 2),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim // 2, 1)
+        )
+    def forward(self, z, edge_label_index):
+        row, col = edge_label_index
+        zi, zj = z[row], z[col]
+        h = torch.cat([zi, zj, zi * zj, torch.abs(zi - zj)], dim=-1)
+        return self.mlp(h).squeeze(-1)
 
 class MeanMessage(nn.Module):
     def __init__(self, in_dim, out_dim):
         super().__init__()
         self.lin = nn.Linear(in_dim, out_dim, bias=False)
-
     def forward(self, x_j, x_i=None, edge_attr=None, index=None):
         return self.lin(x_j)
-
 
 class SymNormMessage(nn.Module):
     def __init__(self, in_dim, out_dim):
         super().__init__()
         self.lin = nn.Linear(in_dim, out_dim, bias=False)
         self.is_sym_norm = True
-
     def forward(self, x_j, x_i=None, edge_attr=None, index=None):
         return self.lin(x_j) * edge_attr
 
-
 class ConvMessage(nn.Module):
-    def __init__(self, in_dim, out_dim):
+    def __init__(self, in_dim, out_dim, num_edges):
         super().__init__()
         self.lin = nn.Linear(in_dim, out_dim, bias=False)
-        self.conv_weight = nn.Parameter(torch.ones(1))
-
+        self.edge_weights = nn.Embedding(num_edges, 1)
+        self.is_conv = True
+        nn.init.constant_(self.edge_weights.weight, 1.0)
     def forward(self, x_j, x_i=None, edge_attr=None, index=None):
-        return self.lin(x_j) * self.conv_weight
-
+        edge_id = edge_attr.squeeze(-1).long()
+        w = self.edge_weights(edge_id)
+        return self.lin(x_j) * w
 
 class AttentionMessage(nn.Module):
     def __init__(self, in_dim, out_dim, heads=4):
@@ -58,34 +59,12 @@ class AttentionMessage(nn.Module):
         self.heads = heads
         self.head_dim = out_dim // heads
         self.lin = nn.Linear(in_dim, out_dim, bias=False)
-
     def forward(self, x_j, x_i, edge_attr=None, index=None):
         x_j_proj = self.lin(x_j).view(-1, self.heads, self.head_dim)
         x_i_proj = self.lin(x_i).view(-1, self.heads, self.head_dim)
         att = (x_i_proj * x_j_proj).sum(dim=-1)
         att = softmax(att, index)
         return (x_j_proj * att.unsqueeze(-1)).view(-1, self.out_dim)
-
-
-class SelfLoopUpdate(nn.Module):
-    def __init__(self, in_dim, out_dim):
-        super().__init__()
-        self.proj = nn.Linear(in_dim, out_dim, bias=False) if in_dim != out_dim else nn.Identity()
-
-    def forward(self, aggr_out, x):
-        return aggr_out + self.proj(x)
-
-
-class GRUUpdate(nn.Module):
-    def __init__(self, in_dim, hidden_dim):
-        super().__init__()
-        self.proj = nn.Linear(in_dim, hidden_dim) if in_dim != hidden_dim else nn.Identity()
-        self.gru = nn.GRUCell(hidden_dim, hidden_dim)
-
-    def forward(self, aggr_out, x):
-        x = self.proj(x)
-        return self.gru(aggr_out, x)
-
 
 def _aggregate_name(agg):
     if isinstance(agg, str):
@@ -102,46 +81,37 @@ def _aggregate_name(agg):
     }
     return mapping.get(cls, cls.__name__)
 
-
-def _update_name(upd):
-    if isinstance(upd, str):
-        return upd
-    if isinstance(upd, type):
-        cls = upd
-    else:
-        cls = type(upd)
-    mapping = {
-        SelfLoopUpdate: 'self_loop',
-        GRUUpdate: 'gru',
-    }
-    return mapping.get(cls, cls.__name__)
-
+def _with_mlp_decoder(model_params, out_dim, hidden_dim=128, dropout=0.2):
+    model_params = dict(model_params)
+    model_params['decoder_fn'] = MLPDecoder(emb_dim=out_dim, hidden_dim=hidden_dim, dropout=dropout)
+    return model_params
 
 def compare_all_combinations(train_loader, val_loader, test_loader,
                              train_data, val_data, test_data,
                              results_file='comparison_results.csv',
                              epochs=50, lr=0.01, weight_decay=5e-4, patience=None,
                              hidden_dim=64, out_dim=64, dropout=0.3, num_layers=2,
-                             attention_heads=4, seed=42, **extra_model_params):
-    set_seed(seed)
-    
+                             attention_heads=4, **extra_model_params):
     aggregate_classes = [MeanMessage, SymNormMessage, ConvMessage, AttentionMessage]
-    update_classes = [SelfLoopUpdate, GRUUpdate]
+    update_methods = ['self_loops', 'gru']
     results = []
     histories = {}
     figs = {}
     diag_results = []
     in_dim = train_data.x.shape[1]
-
+    num_edges = train_data.edge_index.size(1)
     if patience is None:
         patience = max(epochs // 3, 1)
-
     for AggClass in aggregate_classes:
-        for UpdClass in update_classes:
-            combo_name = f"{AggClass.__name__}_{UpdClass.__name__}"
-            print(f"\nТестирование: agg={AggClass.__name__}, update={UpdClass.__name__}")
-
-            if AggClass == AttentionMessage:
+        for upd_method in update_methods:
+            combo_name = f"{AggClass.__name__}_{upd_method}"
+            print(f"\nТестирование: agg={AggClass.__name__}, update={upd_method}")
+            if AggClass == ConvMessage:
+                msg_list = [
+                    ConvMessage(in_dim if i == 0 else hidden_dim, hidden_dim, num_edges)
+                    for i in range(num_layers)
+                ]
+            elif AggClass == AttentionMessage:
                 msg_list = [
                     AttentionMessage(in_dim if i == 0 else hidden_dim,
                                      hidden_dim, heads=attention_heads)
@@ -152,18 +122,6 @@ def compare_all_combinations(train_loader, val_loader, test_loader,
                     AggClass(in_dim if i == 0 else hidden_dim, hidden_dim)
                     for i in range(num_layers)
                 ]
-
-            if UpdClass == SelfLoopUpdate:
-                upd_list = [
-                    SelfLoopUpdate(in_dim if i == 0 else hidden_dim, hidden_dim)
-                    for i in range(num_layers)
-                ]
-            else:
-                upd_list = [
-                    GRUUpdate(in_dim if i == 0 else hidden_dim, hidden_dim)
-                    for i in range(num_layers)
-                ]
-
             aggr_str = 'mean' if AggClass == MeanMessage else 'add'
             model_params = {
                 'in_channels': in_dim,
@@ -172,11 +130,11 @@ def compare_all_combinations(train_loader, val_loader, test_loader,
                 'num_layers': num_layers,
                 'message_fn': msg_list,
                 'aggr': aggr_str,
-                'update_fn': upd_list,
+                'update': upd_method,
                 'dropout': dropout,
             }
             model_params.update(extra_model_params)
-
+            model_params = _with_mlp_decoder(model_params, out_dim)
             try:
                 predictor = LinkPredictor(
                     train_loader=train_loader,
@@ -192,7 +150,6 @@ def compare_all_combinations(train_loader, val_loader, test_loader,
                 predictor.train_data = train_data
                 predictor.val_data = val_data
                 predictor.test_data = test_data
-
                 model, test_fpr, test_auprc = predictor.run()
                 best_val_fpr = min(predictor.history['val_fpr']) if predictor.history['val_fpr'] else 1.0
                 best_val_auprc = max(predictor.history['val_auprc']) if predictor.history['val_auprc'] else 0.0
@@ -201,7 +158,7 @@ def compare_all_combinations(train_loader, val_loader, test_loader,
                 diag_results.append(diag)
                 res = {
                     'aggregate': AggClass.__name__,
-                    'update': UpdClass.__name__,
+                    'update': upd_method,
                     'test_fpr': test_fpr,
                     'test_auprc': test_auprc,
                     'best_val_fpr': best_val_fpr,
@@ -215,18 +172,16 @@ def compare_all_combinations(train_loader, val_loader, test_loader,
                 print(f"   Ошибка: {e}")
                 results.append({
                     'aggregate': AggClass.__name__,
-                    'update': UpdClass.__name__,
+                    'update': upd_method,
                     'test_fpr': 1.0,
                     'test_auprc': 0.0,
                     'error': str(e)
                 })
                 histories[combo_name] = None
-
     df_results = pd.DataFrame(results)
     df_results.to_csv(results_file, index=False)
     print(f"\nРезультаты сохранены в: {results_file}")
     return df_results, histories, figs, diag_results
-
 
 def plot_comparison_results(results, save_path=None):
     if isinstance(results, str):
@@ -235,9 +190,7 @@ def plot_comparison_results(results, save_path=None):
         df = results.copy()
     if 'error' in df.columns:
         df = df[df['error'].isna()]
-
     fig, axes = plt.subplots(1, 2, figsize=(16, 6))
-
     ax1 = axes[0]
     combos = [f"{r['aggregate']}\n{r['update']}" for _, r in df.iterrows()]
     fprs = df['test_fpr'].values
@@ -255,7 +208,6 @@ def plot_comparison_results(results, save_path=None):
     ax1.axhline(y=0.5, color='orange', linestyle='--', alpha=0.5, label='приемлемо ≤0.5')
     ax1.legend()
     ax1.grid(True, axis='y', alpha=0.3)
-
     ax2 = axes[1]
     agg_methods = df['aggregate'].unique()
     upd_methods = df['update'].unique()
@@ -277,13 +229,12 @@ def plot_comparison_results(results, save_path=None):
         for j in range(len(upd_methods)):
             ax2.text(j, i, f'{heatmap[i, j]:.4f}',
                      ha="center", va="center", color="black", fontsize=10, fontweight='bold')
-    cbar = plt.colorbar(im, ax=2)
+    cbar = plt.colorbar(im, ax=axes[1])
     cbar.set_label('Test AUCPR')
     plt.tight_layout()
     if save_path:
         plt.savefig(save_path, dpi=150, bbox_inches='tight')
     plt.show()
-
 
 def plot_all_learning_curves(histories, save_path=None):
     n_combos = len(histories)
@@ -314,20 +265,16 @@ def plot_all_learning_curves(histories, save_path=None):
         plt.savefig(save_path, dpi=150, bbox_inches='tight')
     plt.show()
 
-
 def train_and_plot_all_combinations(train_loader, val_loader, test_loader,
                                     train_data, val_data, test_data,
                                     epochs=30, lr=0.01, weight_decay=5e-4, patience=None,
                                     save_dir='training_plots',
                                     hidden_dim=64, out_dim=64, dropout=0.3, num_layers=2,
-                                    attention_heads=4, seed=42, **extra_model_params):
-    set_seed(seed)
-    
+                                    attention_heads=4, **extra_model_params):
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     save_dir = f"{save_dir}_{timestamp}"
     os.makedirs(save_dir, exist_ok=True)
     print(f"\nРезультаты будут сохранены в: {save_dir}/")
-
     df_results, histories, figs, diag_results = compare_all_combinations(
         train_loader, val_loader, test_loader,
         train_data, val_data, test_data,
@@ -341,12 +288,10 @@ def train_and_plot_all_combinations(train_loader, val_loader, test_loader,
         dropout=dropout,
         num_layers=num_layers,
         attention_heads=attention_heads,
-        seed=seed,
         **extra_model_params
     )
     plot_all_learning_curves(histories, save_path=f'{save_dir}/learning_curves.png')
     plot_comparison_results(df_results, save_path=f'{save_dir}/comparison.png')
-
     diag_dir = os.path.join(save_dir, 'diagnostics')
     os.makedirs(diag_dir, exist_ok=True)
     for name, fig in figs.items():
@@ -355,7 +300,6 @@ def train_and_plot_all_combinations(train_loader, val_loader, test_loader,
             fig.savefig(path, dpi=150, bbox_inches='tight')
             plt.close(fig)
     print(f"Диагностические графики сохранены в: {diag_dir}")
-
     best_idx = df_results['test_auprc'].idxmax()
     best = df_results.loc[best_idx]
     print("\n" + "=" * 80)
@@ -365,13 +309,11 @@ def train_and_plot_all_combinations(train_loader, val_loader, test_loader,
     print(f"   метод update: {best['update'].upper()}")
     print(f"   test FPR: {best['test_fpr']:.4f}")
     print(f"   test AUCPR: {best['test_auprc']:.4f}")
-
     print("\nРейтинг по test AUCPR:")
     ranking = df_results.sort_values('test_auprc', ascending=False)
     for i, row in ranking.iterrows():
         print(f"   {i+1:2d}. {row['aggregate']:12} + {row['update']:12} : FPR={row['test_fpr']:.4f}, AUCPR={row['test_auprc']:.4f}")
     return df_results, histories
-
 
 def create_model_summary_table(df_results):
     summary = []
@@ -395,7 +337,6 @@ def create_model_summary_table(df_results):
         })
     return pd.DataFrame(summary)
 
-
 def create_model(aggregate_method, update_method, in_channels,
                  hidden_channels=64, out_channels=64, num_layers=2):
     return LinkPredictionMessagePassingModel(
@@ -404,10 +345,10 @@ def create_model(aggregate_method, update_method, in_channels,
         out_channels=out_channels,
         num_layers=num_layers,
         aggr=aggregate_method,
-        update_fn=update_method,
+        update=update_method,
         dropout=0.3,
+        decoder_fn=MLPDecoder(out_channels)
     )
-
 
 def get_method_description(method_name, method_type='aggregate'):
     descriptions = {
@@ -419,12 +360,11 @@ def get_method_description(method_name, method_type='aggregate'):
             'attention': 'Attention-агрегация (GAT style).',
         },
         'update': {
-            'self_loop': 'Классическое self-loop обновление.',
+            'self_loops': 'Классическое self-loop обновление (добавлением петель).',
             'gru': 'GRU-обновление.',
         }
     }
     return descriptions.get(method_type, {}).get(method_name, 'Описание не найдено')
-
 
 def print_methods_info():
     print("\n" + "=" * 80)
@@ -434,18 +374,15 @@ def print_methods_info():
     for method in ['mean', 'sym_norm', 'janossy', 'conv', 'attention']:
         print(f"   {method.upper():12} - {get_method_description(method, 'aggregate')}")
     print("\nМетоды update:")
-    for method in ['self_loop', 'gru']:
+    for method in ['self_loops', 'gru']:
         print(f"   {method.upper():12} - {get_method_description(method, 'update')}")
     print("\nВсего комбинаций: 5 x 2 = 10")
-
 
 class DataLeakError(Exception):
     pass
 
-
 class MetricMismatchError(Exception):
     pass
-
 
 def diagnose_link_predictor(predictor, tolerance=1e-3):
     required_attrs = ['train_data', 'val_data', 'test_data', 'train_loader', 'val_loader',
@@ -453,20 +390,16 @@ def diagnose_link_predictor(predictor, tolerance=1e-3):
     for attr in required_attrs:
         if not hasattr(predictor, attr):
             raise AttributeError(f"predictor должен иметь атрибут '{attr}'")
-
     train_data = predictor.train_data
     mp_edges = set(map(tuple, train_data.edge_index.t().tolist()))
-
     if (id(predictor.val_loader.data) != id(train_data) or
         id(predictor.test_loader.data) != id(train_data)):
         raise DataLeakError("val/test загрузчики используют граф, отличный от train_data")
-
     for name, data in [("val", predictor.val_data), ("test", predictor.test_data)]:
         pos_mask = data.edge_label.bool()
         target_pos = set(map(tuple, data.edge_label_index[:, pos_mask].t().tolist()))
         if len(target_pos & mp_edges) > 0:
             raise DataLeakError(f"Целевые рёбра {name} пересекаются с графом message passing")
-
     model = predictor.model
     device = predictor.device
     model.eval()
@@ -474,25 +407,23 @@ def diagnose_link_predictor(predictor, tolerance=1e-3):
     with torch.no_grad():
         for batch in predictor.test_loader:
             batch = batch.to(device)
-            logits = model(batch.x, batch.edge_index, batch.edge_label_index)
+            edge_id = getattr(batch, 'edge_id', None)
+            logits = model(batch.x, batch.edge_index, batch.edge_label_index, edge_id=edge_id)
             probs = torch.sigmoid(logits).cpu()
             all_probs.append(probs)
             all_labels.append(batch.edge_label.cpu())
     all_probs = torch.cat(all_probs).numpy()
     all_labels = torch.cat(all_labels).numpy()
-
     auprc_calc = average_precision_score(all_labels, all_probs)
     auc_calc = roc_auc_score(all_labels, all_probs)
     preds = (all_probs > 0.5).astype(float)
     fpr_calc = preds[all_labels == 0].mean() if (all_labels == 0).sum() > 0 else 0.0
-
     if (abs(auprc_calc - predictor.test_auprc) > tolerance or
         abs(fpr_calc - predictor.test_fpr) > tolerance):
         raise MetricMismatchError(
             f"Метрики расходятся: AUCPR {auprc_calc:.4f} vs {predictor.test_auprc:.4f}, "
             f"FPR {fpr_calc:.4f} vs {predictor.test_fpr:.4f}"
         )
-
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 4))
     ax1.hist(all_probs[all_labels == 1], bins=40, alpha=0.6, label='Positive', color='blue')
     ax1.hist(all_probs[all_labels == 0], bins=40, alpha=0.6, label='Negative', color='red')
@@ -501,13 +432,10 @@ def diagnose_link_predictor(predictor, tolerance=1e-3):
     ax1.set_title('Probability distribution (test)')
     ax1.legend()
     ax1.grid(alpha=0.3)
-
     PrecisionRecallDisplay.from_predictions(all_labels, all_probs, ax=ax2, name='Model')
     ax2.set_title('Precision-Recall curve (test)')
     ax2.grid(alpha=0.3)
-
     fig.tight_layout()
-
     results = {
         'auprc': auprc_calc,
         'auc_roc': auc_calc,
@@ -518,37 +446,27 @@ def diagnose_link_predictor(predictor, tolerance=1e-3):
     }
     return fig, results
 
-
 def optimize_single_pair(train_loader, val_loader, test_loader,
                          train_data, val_data, test_data,
-                         aggregate_class, update_class,
+                         aggregate_class, update_method,
                          n_trials=50, timeout=None,
                          save_dir='optuna_single',
-                         final_epochs=200,
-                         seed=42):
+                         final_epochs=200):
     try:
         import optuna
         from optuna.trial import Trial
     except ImportError:
         raise ImportError("Установите optuna: pip install optuna")
-    
-    set_seed(seed)
-    
-    combo_name = f"{aggregate_class.__name__}_{update_class.__name__}"
+    combo_name = f"{aggregate_class.__name__}_{update_method}"
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     save_dir = f"{save_dir}_{combo_name}_{timestamp}"
     os.makedirs(save_dir, exist_ok=True)
-    
     print("\n" + "=" * 80)
     print(f"ОПТИМИЗАЦИЯ ДЛЯ: {combo_name}")
     print("=" * 80)
-    
     in_dim = train_data.x.shape[1]
-    
+    num_edges = train_data.edge_index.size(1)
     def objective(trial: Trial):
-        trial_seed = seed + trial.number
-        set_seed(trial_seed)
-        
         params = {
             'hidden_dim': trial.suggest_categorical('hidden_dim', [32, 64, 96, 128]),
             'out_dim': trial.suggest_categorical('out_dim', [32, 48, 64, 96, 128]),
@@ -558,11 +476,15 @@ def optimize_single_pair(train_loader, val_loader, test_loader,
             'weight_decay': trial.suggest_float('weight_decay', 1e-5, 1e-2, log=True),
             'patience': trial.suggest_int('patience', 20, 80, step=10),
         }
-        
         if aggregate_class == AttentionMessage:
             params['attention_heads'] = trial.suggest_categorical('attention_heads', [2, 4, 8])
-        
-        if aggregate_class == AttentionMessage:
+        if aggregate_class == ConvMessage:
+            msg_list = [
+                ConvMessage(in_dim if i == 0 else params['hidden_dim'],
+                            params['hidden_dim'], num_edges)
+                for i in range(params['num_layers'])
+            ]
+        elif aggregate_class == AttentionMessage:
             msg_list = [
                 AttentionMessage(in_dim if i == 0 else params['hidden_dim'],
                                  params['hidden_dim'], heads=params['attention_heads'])
@@ -573,20 +495,7 @@ def optimize_single_pair(train_loader, val_loader, test_loader,
                 aggregate_class(in_dim if i == 0 else params['hidden_dim'], params['hidden_dim'])
                 for i in range(params['num_layers'])
             ]
-        
-        if update_class == SelfLoopUpdate:
-            upd_list = [
-                SelfLoopUpdate(in_dim if i == 0 else params['hidden_dim'], params['hidden_dim'])
-                for i in range(params['num_layers'])
-            ]
-        else:
-            upd_list = [
-                GRUUpdate(in_dim if i == 0 else params['hidden_dim'], params['hidden_dim'])
-                for i in range(params['num_layers'])
-            ]
-        
         aggr_str = 'mean' if aggregate_class == MeanMessage else 'add'
-        
         model_params = {
             'in_channels': in_dim,
             'hidden_channels': params['hidden_dim'],
@@ -594,10 +503,10 @@ def optimize_single_pair(train_loader, val_loader, test_loader,
             'num_layers': params['num_layers'],
             'message_fn': msg_list,
             'aggr': aggr_str,
-            'update_fn': upd_list,
+            'update': update_method,
             'dropout': params['dropout'],
         }
-        
+        model_params = _with_mlp_decoder(model_params, params['out_dim'])
         try:
             predictor = LinkPredictor(
                 train_loader=train_loader,
@@ -610,61 +519,49 @@ def optimize_single_pair(train_loader, val_loader, test_loader,
                 lr=params['lr'],
                 weight_decay=params['weight_decay']
             )
-            
             predictor.train_data = train_data
             predictor.val_data = val_data
             predictor.test_data = test_data
-            
             model, test_fpr, test_auprc = predictor.run()
-            
             best_val_auprc = max(predictor.history['val_auprc']) if predictor.history['val_auprc'] else 0.0
             best_val_fpr = min(predictor.history['val_fpr']) if predictor.history['val_fpr'] else 1.0
-            
             trial.set_user_attr('test_auprc', test_auprc)
             trial.set_user_attr('test_fpr', test_fpr)
             trial.set_user_attr('best_val_auprc', best_val_auprc)
             trial.set_user_attr('best_val_fpr', best_val_fpr)
-            
             score = best_val_auprc
-            
             return score
-            
         except Exception as e:
             print(f"  Ошибка в trial: {e}")
             return -1.0
-    
     study_name = f"{combo_name}_{timestamp}"
     study = optuna.create_study(
         direction='maximize',
         study_name=study_name,
         storage=f'sqlite:///{save_dir}/{combo_name}.db',
-        load_if_exists=True,
-        sampler=optuna.samplers.RandomSampler(seed=seed)
+        load_if_exists=True
     )
-    
     print(f"\nЗапуск оптимизации...")
     print(f"Количество попыток: {n_trials}")
-    
     study.optimize(objective, n_trials=n_trials, timeout=timeout, show_progress_bar=True)
-    
     best_params = study.best_params
     best_value = study.best_value
-    
     print(f"\nЛучшие гиперпараметры для {combo_name}:")
     for key, value in best_params.items():
         print(f"  {key}: {value}")
     print(f"Лучшее значение метрики: {best_value:.4f}")
-    
     trials_df = study.trials_dataframe()
     trials_df.to_csv(f'{save_dir}/{combo_name}_trials.csv', index=False)
-    
     print("\n" + "=" * 80)
     print("ФИНАЛЬНОЕ ОБУЧЕНИЕ С ЛУЧШИМИ ПАРАМЕТРАМИ")
     print("=" * 80)
-    
-    set_seed(seed)
-    
-    if aggregate_class == AttentionMessage:
+    if aggregate_class == ConvMessage:
+        msg_list = [
+            ConvMessage(in_dim if i == 0 else best_params['hidden_dim'],
+                        best_params['hidden_dim'], num_edges)
+            for i in range(best_params['num_layers'])
+        ]
+    elif aggregate_class == AttentionMessage:
         attention_heads = best_params.get('attention_heads', 4)
         msg_list = [
             AttentionMessage(in_dim if i == 0 else best_params['hidden_dim'],
@@ -676,20 +573,7 @@ def optimize_single_pair(train_loader, val_loader, test_loader,
             aggregate_class(in_dim if i == 0 else best_params['hidden_dim'], best_params['hidden_dim'])
             for i in range(best_params['num_layers'])
         ]
-    
-    if update_class == SelfLoopUpdate:
-        upd_list = [
-            SelfLoopUpdate(in_dim if i == 0 else best_params['hidden_dim'], best_params['hidden_dim'])
-            for i in range(best_params['num_layers'])
-        ]
-    else:
-        upd_list = [
-            GRUUpdate(in_dim if i == 0 else best_params['hidden_dim'], best_params['hidden_dim'])
-            for i in range(best_params['num_layers'])
-        ]
-    
     aggr_str = 'mean' if aggregate_class == MeanMessage else 'add'
-    
     model_params = {
         'in_channels': in_dim,
         'hidden_channels': best_params['hidden_dim'],
@@ -697,10 +581,10 @@ def optimize_single_pair(train_loader, val_loader, test_loader,
         'num_layers': best_params['num_layers'],
         'message_fn': msg_list,
         'aggr': aggr_str,
-        'update_fn': upd_list,
+        'update': update_method,
         'dropout': best_params['dropout'],
     }
-    
+    model_params = _with_mlp_decoder(model_params, best_params['out_dim'])
     predictor = LinkPredictor(
         train_loader=train_loader,
         val_loader=val_loader,
@@ -712,33 +596,27 @@ def optimize_single_pair(train_loader, val_loader, test_loader,
         lr=best_params['lr'],
         weight_decay=best_params['weight_decay']
     )
-    
     predictor.train_data = train_data
     predictor.val_data = val_data
     predictor.test_data = test_data
-    
     model, test_fpr, test_auprc = predictor.run()
-    
     results = {
         'aggregate': aggregate_class.__name__,
-        'update': update_class.__name__,
+        'update': update_method,
         'best_params': best_params,
         'optuna_best_value': best_value,
         'test_fpr': test_fpr,
         'test_auprc': test_auprc,
         'final_epochs': final_epochs
     }
-    
     results_df = pd.DataFrame([results])
     results_df.to_csv(f'{save_dir}/final_results.csv', index=False)
-    
     torch.save({
         'model_state_dict': model.state_dict(),
         'best_params': best_params,
         'test_fpr': test_fpr,
         'test_auprc': test_auprc,
     }, f'{save_dir}/{combo_name}_model.pt')
-    
     print("\n" + "=" * 80)
     print("ГОТОВО!")
     print("=" * 80)
@@ -749,55 +627,41 @@ def optimize_single_pair(train_loader, val_loader, test_loader,
     for key, value in best_params.items():
         print(f"  {key}: {value}")
     print(f"\nРезультаты сохранены в: {save_dir}/")
-    
     return best_params, test_fpr, test_auprc
-
 
 def run_with_optuna(train_loader, val_loader, test_loader,
                     train_data, val_data, test_data,
                     n_trials=50, timeout=None,
                     save_dir='optuna_results',
-                    aggregate_class=None, update_class=None,
+                    aggregate_class=None, update_method=None,
                     study_name=None,
-                    final_epochs=200,
-                    seed=42):
+                    final_epochs=200):
     try:
         import optuna
         from optuna.trial import Trial
     except ImportError:
         raise ImportError("Установите optuna: pip install optuna")
-    
-    set_seed(seed)
-    
     aggregate_classes = [MeanMessage, SymNormMessage, ConvMessage, AttentionMessage]
-    update_classes = [SelfLoopUpdate, GRUUpdate]
-    
+    update_methods = ['self_loops', 'gru']
     if aggregate_class is not None:
         aggregate_classes = [aggregate_class]
-    if update_class is not None:
-        update_classes = [update_class]
-    
+    if update_method is not None:
+        update_methods = [update_method]
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     save_dir = f"{save_dir}_{timestamp}"
     os.makedirs(save_dir, exist_ok=True)
-    
     all_best_params = {}
-    
     for AggClass in aggregate_classes:
-        for UpdClass in update_classes:
-            combo_name = f"{AggClass.__name__}_{UpdClass.__name__}"
+        for upd_method in update_methods:
+            combo_name = f"{AggClass.__name__}_{upd_method}"
             print("\n" + "=" * 80)
             print(f"OPTUNA ОПТИМИЗАЦИЯ ДЛЯ: {combo_name}")
             print("=" * 80)
-            
             in_dim = train_data.x.shape[1]
-            
+            num_edges = train_data.edge_index.size(1)
             def objective(trial: Trial):
-                trial_seed = seed + trial.number
-                set_seed(trial_seed)
-                
                 params = {
-                    'hidden_dim': trial.suggest_categorical('hidden_dim', [32, 48, 64, 96, 128]),
+                    'hidden_dim': trial.suggest_categorical('hidden_dim', [32, 48,  64, 96, 128]),
                     'out_dim': trial.suggest_categorical('out_dim', [32, 48, 64, 96, 128]),
                     'num_layers': trial.suggest_int('num_layers', 1, 6),
                     'dropout': trial.suggest_float('dropout', 0.1, 0.6, step=0.05),
@@ -805,11 +669,15 @@ def run_with_optuna(train_loader, val_loader, test_loader,
                     'weight_decay': trial.suggest_float('weight_decay', 1e-5, 1e-2, log=True),
                     'patience': trial.suggest_int('patience', 20, 80, step=10),
                 }
-                
                 if AggClass == AttentionMessage:
                     params['attention_heads'] = trial.suggest_categorical('attention_heads', [2, 4, 8])
-                
-                if AggClass == AttentionMessage:
+                if AggClass == ConvMessage:
+                    msg_list = [
+                        ConvMessage(in_dim if i == 0 else params['hidden_dim'],
+                                    params['hidden_dim'], num_edges)
+                        for i in range(params['num_layers'])
+                    ]
+                elif AggClass == AttentionMessage:
                     msg_list = [
                         AttentionMessage(in_dim if i == 0 else params['hidden_dim'],
                                          params['hidden_dim'], heads=params['attention_heads'])
@@ -820,20 +688,7 @@ def run_with_optuna(train_loader, val_loader, test_loader,
                         AggClass(in_dim if i == 0 else params['hidden_dim'], params['hidden_dim'])
                         for i in range(params['num_layers'])
                     ]
-                
-                if UpdClass == SelfLoopUpdate:
-                    upd_list = [
-                        SelfLoopUpdate(in_dim if i == 0 else params['hidden_dim'], params['hidden_dim'])
-                        for i in range(params['num_layers'])
-                    ]
-                else:
-                    upd_list = [
-                        GRUUpdate(in_dim if i == 0 else params['hidden_dim'], params['hidden_dim'])
-                        for i in range(params['num_layers'])
-                    ]
-                
                 aggr_str = 'mean' if AggClass == MeanMessage else 'add'
-                
                 model_params = {
                     'in_channels': in_dim,
                     'hidden_channels': params['hidden_dim'],
@@ -841,10 +696,10 @@ def run_with_optuna(train_loader, val_loader, test_loader,
                     'num_layers': params['num_layers'],
                     'message_fn': msg_list,
                     'aggr': aggr_str,
-                    'update_fn': upd_list,
+                    'update': upd_method,
                     'dropout': params['dropout'],
                 }
-                
+                model_params = _with_mlp_decoder(model_params, params['out_dim'])
                 try:
                     predictor = LinkPredictor(
                         train_loader=train_loader,
@@ -857,102 +712,83 @@ def run_with_optuna(train_loader, val_loader, test_loader,
                         lr=params['lr'],
                         weight_decay=params['weight_decay']
                     )
-                    
                     predictor.train_data = train_data
                     predictor.val_data = val_data
                     predictor.test_data = test_data
-                    
                     model, test_fpr, test_auprc = predictor.run()
-                    
                     best_val_auprc = max(predictor.history['val_auprc']) if predictor.history['val_auprc'] else 0.0
                     best_val_fpr = min(predictor.history['val_fpr']) if predictor.history['val_fpr'] else 1.0
-                    
                     trial.set_user_attr('test_auprc', test_auprc)
                     trial.set_user_attr('test_fpr', test_fpr)
                     trial.set_user_attr('best_val_auprc', best_val_auprc)
                     trial.set_user_attr('best_val_fpr', best_val_fpr)
-                    
                     score = best_val_auprc
-                    
                     return score
-                    
                 except Exception as e:
                     print(f"  Ошибка в trial: {e}")
                     return -1.0
-            
             study_name_current = study_name or f"{combo_name}_{timestamp}"
             study = optuna.create_study(
                 direction='maximize',
                 study_name=study_name_current,
                 storage=f'sqlite:///{save_dir}/{combo_name}.db',
-                load_if_exists=True,
-                sampler=optuna.samplers.RandomSampler(seed=seed)
+                load_if_exists=True
             )
-            
             print(f"\nЗапуск оптимизации для {combo_name}")
             print(f"Количество попыток: {n_trials}")
-            
             study.optimize(objective, n_trials=n_trials, timeout=timeout, show_progress_bar=True)
-            
             best_params = study.best_params
             best_value = study.best_value
-            
             print(f"\nЛучшие гиперпараметры для {combo_name}:")
             for key, value in best_params.items():
                 print(f"  {key}: {value}")
             print(f"Лучшее значение метрики: {best_value:.4f}")
-            
             trials_df = study.trials_dataframe()
             trials_df.to_csv(f'{save_dir}/{combo_name}_trials.csv', index=False)
-            
             all_best_params[combo_name] = {
                 'best_params': best_params,
                 'best_value': best_value,
                 'aggregate_class': AggClass,
-                'update_class': UpdClass,
+                'update_method': upd_method,
                 'in_dim': in_dim
             }
-    
     print("\n" + "=" * 80)
     print("ОПТИМИЗАЦИЯ ЗАВЕРШЕНА")
     print("=" * 80)
-    
     best_overall = None
     best_overall_value = -1
-    
     for combo_name, result in all_best_params.items():
         if result['best_value'] > best_overall_value:
             best_overall_value = result['best_value']
             best_overall = (combo_name, result)
-    
     if best_overall:
         print(f"\nЛучшая комбинация: {best_overall[0]}")
         print(f"Лучшее значение метрики: {best_overall_value:.4f}")
         print("Лучшие гиперпараметры:")
         for key, value in best_overall[1]['best_params'].items():
             print(f"  {key}: {value}")
-    
     print("\n" + "=" * 80)
     print("ФИНАЛЬНОЕ ОБУЧЕНИЕ С ЛУЧШИМИ ГИПЕРПАРАМЕТРАМИ")
     print("=" * 80)
-    
-    set_seed(seed)
-    
     final_results = {}
     final_histories = {}
-    
     for combo_name, result in all_best_params.items():
         AggClass = result['aggregate_class']
-        UpdClass = result['update_class']
+        upd_method = result['update_method']
         best_params = result['best_params']
         in_dim = result['in_dim']
-        
+        num_edges_final = train_data.edge_index.size(1)
         print(f"\nФинальное обучение для: {combo_name}")
         print(f"Используемые параметры:")
         for key, value in best_params.items():
             print(f"  {key}: {value}")
-        
-        if AggClass == AttentionMessage:
+        if AggClass == ConvMessage:
+            msg_list = [
+                ConvMessage(in_dim if i == 0 else best_params['hidden_dim'],
+                            best_params['hidden_dim'], num_edges_final)
+                for i in range(best_params['num_layers'])
+            ]
+        elif AggClass == AttentionMessage:
             attention_heads = best_params.get('attention_heads', 4)
             msg_list = [
                 AttentionMessage(in_dim if i == 0 else best_params['hidden_dim'],
@@ -964,20 +800,7 @@ def run_with_optuna(train_loader, val_loader, test_loader,
                 AggClass(in_dim if i == 0 else best_params['hidden_dim'], best_params['hidden_dim'])
                 for i in range(best_params['num_layers'])
             ]
-        
-        if UpdClass == SelfLoopUpdate:
-            upd_list = [
-                SelfLoopUpdate(in_dim if i == 0 else best_params['hidden_dim'], best_params['hidden_dim'])
-                for i in range(best_params['num_layers'])
-            ]
-        else:
-            upd_list = [
-                GRUUpdate(in_dim if i == 0 else best_params['hidden_dim'], best_params['hidden_dim'])
-                for i in range(best_params['num_layers'])
-            ]
-        
         aggr_str = 'mean' if AggClass == MeanMessage else 'add'
-        
         try:
             df_results, histories, figs, diag_results = compare_all_combinations(
                 train_loader, val_loader, test_loader,
@@ -991,24 +814,19 @@ def run_with_optuna(train_loader, val_loader, test_loader,
                 out_dim=best_params['out_dim'],
                 dropout=best_params['dropout'],
                 num_layers=best_params['num_layers'],
-                attention_heads=best_params.get('attention_heads', 4),
-                seed=seed
+                attention_heads=best_params.get('attention_heads', 4)
             )
-            
             final_results[combo_name] = df_results
             final_histories[combo_name] = histories
-            
             if len(df_results) > 0:
                 best_row = df_results.iloc[0]
                 print(f"\nРезультаты финального обучения для {combo_name}:")
                 print(f"  Test FPR: {best_row['test_fpr']:.4f}")
                 print(f"  Test AUCPR: {best_row['test_auprc']:.4f}")
-            
         except Exception as e:
             print(f"  Ошибка при финальном обучении: {e}")
             import traceback
             traceback.print_exc()
-    
     summary = []
     for combo_name, result in all_best_params.items():
         row = {
@@ -1018,10 +836,8 @@ def run_with_optuna(train_loader, val_loader, test_loader,
         for key, value in result['best_params'].items():
             row[f'optuna_{key}'] = value
         summary.append(row)
-    
     summary_df = pd.DataFrame(summary)
     summary_df.to_csv(f'{save_dir}/best_params_summary.csv', index=False)
-    
     print("\n" + "=" * 80)
     print("ГОТОВО!")
     print("=" * 80)
@@ -1029,21 +845,15 @@ def run_with_optuna(train_loader, val_loader, test_loader,
     print("  - best_params_summary.csv - лучшие параметры для каждой комбинации")
     print("  - final_*_results.csv - результаты финального обучения")
     print("  - *_trials.csv - все попытки оптимизации")
-    
     return all_best_params, final_results, final_histories
-
 
 def optimize_best_combination(train_loader, val_loader, test_loader,
                                train_data, val_data, test_data,
                                n_trials=100, timeout=None,
-                               save_dir='best_optimization',
-                               seed=42):
-    set_seed(seed)
-    
+                               save_dir='best_optimization'):
     print("=" * 80)
     print("ШАГ 1: ОПРЕДЕЛЕНИЕ ЛУЧШЕЙ КОМБИНАЦИИ МЕТОДОВ")
     print("=" * 80)
-    
     df_results, histories, figs, diag_results = compare_all_combinations(
         train_loader, val_loader, test_loader,
         train_data, val_data, test_data,
@@ -1051,36 +861,24 @@ def optimize_best_combination(train_loader, val_loader, test_loader,
         hidden_dim=64,
         out_dim=64,
         dropout=0.3,
-        num_layers=2,
-        seed=seed
+        num_layers=2
     )
-    
     best_idx = df_results['test_auprc'].idxmax()
     best_row = df_results.loc[best_idx]
     best_aggregate_name = best_row['aggregate']
     best_update_name = best_row['update']
-    
     agg_map = {
         'MeanMessage': MeanMessage,
         'SymNormMessage': SymNormMessage,
         'ConvMessage': ConvMessage,
         'AttentionMessage': AttentionMessage,
     }
-    upd_map = {
-        'SelfLoopUpdate': SelfLoopUpdate,
-        'GRUUpdate': GRUUpdate,
-    }
-    
     best_agg_class = agg_map.get(best_aggregate_name)
-    best_upd_class = upd_map.get(best_update_name)
-    
     print(f"\nЛучшая комбинация: {best_aggregate_name} + {best_update_name}")
     print(f"Test AUCPR: {best_row['test_auprc']:.4f}")
-    
     print("\n" + "=" * 80)
     print("ШАГ 2: ОПТИМИЗАЦИЯ ГИПЕРПАРАМЕТРОВ ДЛЯ ЛУЧШЕЙ КОМБИНАЦИИ")
     print("=" * 80)
-    
     results = run_with_optuna(
         train_loader, val_loader, test_loader,
         train_data, val_data, test_data,
@@ -1088,28 +886,20 @@ def optimize_best_combination(train_loader, val_loader, test_loader,
         timeout=timeout,
         save_dir=save_dir,
         aggregate_class=best_agg_class,
-        update_class=best_upd_class,
-        study_name=f"best_{best_aggregate_name}_{best_update_name}",
-        seed=seed
+        update_method=best_update_name,
+        study_name=f"best_{best_aggregate_name}_{best_update_name}"
     )
-    
     return results
-
 
 def run_optuna_for_all_combinations(train_loader, val_loader, test_loader,
                                      train_data, val_data, test_data,
                                      n_trials_per_combo=30, timeout=None,
-                                     save_dir='optuna_all_combinations',
-                                     seed=42):
-    set_seed(seed)
-    
+                                     save_dir='optuna_all_combinations'):
     aggregate_classes = [MeanMessage, SymNormMessage, ConvMessage, AttentionMessage]
-    update_classes = [SelfLoopUpdate, GRUUpdate]
-    
+    update_methods = ['self_loops', 'gru']
     all_results = {}
-    
     for AggClass in aggregate_classes:
-        for UpdClass in update_classes:
+        for upd_method in update_methods:
             results = run_with_optuna(
                 train_loader, val_loader, test_loader,
                 train_data, val_data, test_data,
@@ -1117,16 +907,13 @@ def run_optuna_for_all_combinations(train_loader, val_loader, test_loader,
                 timeout=timeout,
                 save_dir=save_dir,
                 aggregate_class=AggClass,
-                update_class=UpdClass,
-                study_name=f"{AggClass.__name__}_{UpdClass.__name__}",
-                seed=seed
+                update_method=upd_method,
+                study_name=f"{AggClass.__name__}_{upd_method}"
             )
             all_results.update(results)
-    
     print("\n" + "=" * 80)
     print("СРАВНЕНИЕ ОПТИМИЗИРОВАННЫХ КОМБИНАЦИЙ")
     print("=" * 80)
-    
     comparison = []
     for combo_name, result in all_results.items():
         if isinstance(result, dict) and 'best_value' in result:
@@ -1140,14 +927,11 @@ def run_optuna_for_all_combinations(train_loader, val_loader, test_loader,
                 'lr': result['best_params'].get('lr'),
                 'weight_decay': result['best_params'].get('weight_decay'),
             })
-    
     if comparison:
         comparison_df = pd.DataFrame(comparison)
         comparison_df = comparison_df.sort_values('лучшая_метрика', ascending=False)
         comparison_df.to_csv(f'{save_dir}/comparison.csv', index=False)
-        
         print("\nРейтинг оптимизированных комбинаций:")
         for i, row in comparison_df.iterrows():
             print(f"  {i+1}. {row['комбинация']}: {row['лучшая_метрика']:.4f}")
-    
     return all_results
