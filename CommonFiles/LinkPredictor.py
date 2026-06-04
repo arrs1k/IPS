@@ -101,7 +101,10 @@ class LinkPredictionMessagePassingModel(nn.Module):
         for i, (layer, norm) in enumerate(zip(self.layers, self.norms)):
             if hasattr(layer, 'message_fn') and layer.message_fn is not None:
                 if getattr(layer.message_fn, 'is_conv', False):
-                    edge_attr = edge_id.unsqueeze(-1).float()
+                    if edge_id is not None:
+                        edge_attr = edge_id.unsqueeze(-1).float()
+                    else:
+                        edge_attr = torch.ones(edge_index.size(1), 1, device=x.device)
                 else:
                     edge_attr = None
             else:
