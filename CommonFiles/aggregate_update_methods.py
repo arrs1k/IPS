@@ -61,11 +61,13 @@ class ConvMessage(nn.Module):
     def __init__(self, in_dim, out_dim, num_edges):
         super().__init__()
         self.lin = nn.Linear(in_dim, out_dim, bias=False)
-        self.edge_weights = nn.Embedding(num_edges, 1)
+        self.num_edges = num_edges 
+        self.edge_weights = nn.Embedding(num_edges + 1, 1)
         self.is_conv = True
         nn.init.constant_(self.edge_weights.weight, 1.0)
     def forward(self, x_j, x_i=None, edge_attr=None, index=None):
         edge_id = edge_attr.squeeze(-1).long()
+        edge_id = torch.clamp(edge_id, 0, self.num_edges)
         w = self.edge_weights(edge_id)
         return self.lin(x_j) * w
 
