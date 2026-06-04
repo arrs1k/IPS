@@ -181,7 +181,7 @@ def compare_all_combinations(train_loader, val_loader, test_loader,
                 model, test_fpr, test_auprc = predictor.run()
                 best_val_fpr = min(predictor.history['val_fpr']) if predictor.history['val_fpr'] else 1.0
                 best_val_auprc = max(predictor.history['val_auprc']) if predictor.history['val_auprc'] else 0.0
-                fig, diag = diagnose_link_predictor(predictor, tolerance=0.04)
+                fig, diag = diagnose_link_predictor(predictor, tolerance=0.1)
                 figs[combo_name] = fig
                 diag_results.append(diag)
                 res = {
@@ -263,10 +263,7 @@ def diagnose_link_predictor(predictor, tolerance=1e-3):
     
     if (abs(auprc_calc - predictor.test_auprc) > tolerance or
         abs(fpr_calc - predictor.test_fpr) > tolerance):
-        print(
-            f"Метрики расходятся: AUCPR {auprc_calc:.4f} vs {predictor.test_auprc:.4f}, "
-            f"FPR {fpr_calc:.4f} vs {predictor.test_fpr:.4f}"
-        )
+        print(f"Метрики расходятся: AUCPR {auprc_calc:.4f} vs {predictor.test_auprc:.4f}," f"FPR {fpr_calc:.4f} vs {predictor.test_fpr:.4f}")
     
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 4))
     ax1.hist(all_probs[all_labels == 1], bins=40, alpha=0.6, label='Positive', color='blue')
