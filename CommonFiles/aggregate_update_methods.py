@@ -757,4 +757,3 @@ def optimize_single_pair(train_loader, val_loader, test_loader,
     print(f"\nРезультаты сохранены в: {save_dir}/")
 
     return best_params, test_fpr, test_auprc
-```
