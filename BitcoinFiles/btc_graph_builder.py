@@ -104,6 +104,8 @@ def main(args):
     data.edge_index, data.edge_attr = remove_self_loops(data.edge_index, data.edge_attr)
     print('self loops removed', data.edge_index.size(1))
 
+    data.edge_id = torch.arange(data.num_edges)
+
     print('RandomLinkSplit...')
     train_data, val_data, test_data = RandomLinkSplit(
         is_undirected=False,

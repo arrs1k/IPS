@@ -548,34 +548,36 @@ def run_with_optuna(train_loader, val_loader, test_loader,
 
     return all_best_params, final_results, final_histories
 
+
 def optimize_single_pair(train_loader, val_loader, test_loader,
                          train_data, val_data, test_data,
                          aggregate_class, update_method,
                          n_trials=50, timeout=None,
                          save_dir='optuna_single',
                          final_epochs=200,
-                         seed=42):
+                         seed=42,
+                         use_mlp_decoder=True):
     import optuna
     from optuna.trial import Trial
-    
+
     set_seed(seed)
-    
+
     combo_name = f"{aggregate_class.__name__}_{update_method}"
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     save_dir = f"{save_dir}_{combo_name}_{timestamp}"
     os.makedirs(save_dir, exist_ok=True)
-    
+
     print("\n" + "=" * 80)
     print(f"ОПТИМИЗАЦИЯ ДЛЯ: {combo_name}")
     print("=" * 80)
-    
+
     in_dim = train_data.x.shape[1]
     num_edges = train_data.edge_index.size(1)
-    
+
     def objective(trial: Trial):
         trial_seed = seed + trial.number
         set_seed(trial_seed)
-        
+
         params = {
             'hidden_dim': trial.suggest_categorical('hidden_dim', [32, 64, 96, 128]),
             'out_dim': trial.suggest_categorical('out_dim', [32, 48, 64, 96, 128]),
@@ -585,10 +587,10 @@ def optimize_single_pair(train_loader, val_loader, test_loader,
             'weight_decay': trial.suggest_float('weight_decay', 1e-5, 1e-2, log=True),
             'patience': trial.suggest_int('patience', 20, 80, step=10),
         }
-        
+
         if aggregate_class == AttentionMessage:
             params['attention_heads'] = trial.suggest_categorical('attention_heads', [2, 4, 8])
-        
+
         if aggregate_class == ConvMessage:
             msg_list = [
                 ConvMessage(in_dim if i == 0 else params['hidden_dim'],
@@ -606,7 +608,7 @@ def optimize_single_pair(train_loader, val_loader, test_loader,
                 aggregate_class(in_dim if i == 0 else params['hidden_dim'], params['hidden_dim'])
                 for i in range(params['num_layers'])
             ]
-        
+
         aggr_str = 'mean' if aggregate_class == MeanMessage else 'add'
         model_params = {
             'in_channels': in_dim,
@@ -618,8 +620,9 @@ def optimize_single_pair(train_loader, val_loader, test_loader,
             'update': update_method,
             'dropout': params['dropout'],
         }
-        model_params = _with_mlp_decoder(model_params, params['out_dim'])
-        
+        if use_mlp_decoder:
+            model_params = _with_mlp_decoder(model_params, params['out_dim'])
+
         try:
             predictor = LinkPredictor(
                 train_loader=train_loader,
@@ -647,33 +650,33 @@ def optimize_single_pair(train_loader, val_loader, test_loader,
         except Exception as e:
             print(f"  Ошибка в trial: {e}")
             return -1.0
-    
+
     study = optuna.create_study(
         direction='maximize',
         sampler=optuna.samplers.RandomSampler(seed=seed)
     )
-    
+
     print(f"\nЗапуск оптимизации...")
     print(f"Количество попыток: {n_trials}")
     study.optimize(objective, n_trials=n_trials, timeout=timeout, show_progress_bar=True)
-    
+
     best_params = study.best_params
     best_value = study.best_value
-    
+
     print(f"\nЛучшие гиперпараметры для {combo_name}:")
     for key, value in best_params.items():
         print(f"  {key}: {value}")
     print(f"Лучшее значение метрики: {best_value:.4f}")
-    
+
     trials_df = study.trials_dataframe()
     trials_df.to_csv(f'{save_dir}/{combo_name}_trials.csv', index=False)
-    
+
     print("\n" + "=" * 80)
     print("ФИНАЛЬНОЕ ОБУЧЕНИЕ С ЛУЧШИМИ ПАРАМЕТРАМИ")
     print("=" * 80)
-    
+
     set_seed(seed)
-    
+
     if aggregate_class == ConvMessage:
         msg_list = [
             ConvMessage(in_dim if i == 0 else best_params['hidden_dim'],
@@ -692,7 +695,7 @@ def optimize_single_pair(train_loader, val_loader, test_loader,
             aggregate_class(in_dim if i == 0 else best_params['hidden_dim'], best_params['hidden_dim'])
             for i in range(best_params['num_layers'])
         ]
-    
+
     aggr_str = 'mean' if aggregate_class == MeanMessage else 'add'
     model_params = {
         'in_channels': in_dim,
@@ -704,8 +707,9 @@ def optimize_single_pair(train_loader, val_loader, test_loader,
         'update': update_method,
         'dropout': best_params['dropout'],
     }
-    model_params = _with_mlp_decoder(model_params, best_params['out_dim'])
-    
+    if use_mlp_decoder:
+        model_params = _with_mlp_decoder(model_params, best_params['out_dim'])
+
     predictor = LinkPredictor(
         train_loader=train_loader,
         val_loader=val_loader,
@@ -721,7 +725,7 @@ def optimize_single_pair(train_loader, val_loader, test_loader,
     predictor.val_data = val_data
     predictor.test_data = test_data
     model, test_fpr, test_auprc = predictor.run()
-    
+
     results = {
         'aggregate': aggregate_class.__name__,
         'update': update_method,
@@ -733,14 +737,14 @@ def optimize_single_pair(train_loader, val_loader, test_loader,
     }
     results_df = pd.DataFrame([results])
     results_df.to_csv(f'{save_dir}/final_results.csv', index=False)
-    
+
     torch.save({
         'model_state_dict': model.state_dict(),
         'best_params': best_params,
         'test_fpr': test_fpr,
         'test_auprc': test_auprc,
     }, f'{save_dir}/{combo_name}_model.pt')
-    
+
     print("\n" + "=" * 80)
     print("ГОТОВО!")
     print("=" * 80)
@@ -751,5 +755,6 @@ def optimize_single_pair(train_loader, val_loader, test_loader,
     for key, value in best_params.items():
         print(f"  {key}: {value}")
     print(f"\nРезультаты сохранены в: {save_dir}/")
-    
+
     return best_params, test_fpr, test_auprc
+```

@@ -126,6 +126,8 @@ def main(args):
 
     data.edge_index, data.edge_attr = remove_self_loops(data.edge_index, data.edge_attr)
 
+    data.edge_id = torch.arange(data.num_edges)
+
     transform = RandomLinkSplit(
         is_undirected=False,
         num_val=args.num_val,
