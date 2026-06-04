@@ -553,9 +553,12 @@ def optimize_single_pair(train_loader, val_loader, test_loader,
                          aggregate_class, update_method,
                          n_trials=50, timeout=None,
                          save_dir='optuna_single',
-                         final_epochs=200):
+                         final_epochs=200,
+                         seed=42):
     import optuna
     from optuna.trial import Trial
+    
+    set_seed(seed)
     
     combo_name = f"{aggregate_class.__name__}_{update_method}"
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -570,6 +573,9 @@ def optimize_single_pair(train_loader, val_loader, test_loader,
     num_edges = train_data.edge_index.size(1)
     
     def objective(trial: Trial):
+        trial_seed = seed + trial.number
+        set_seed(trial_seed)
+        
         params = {
             'hidden_dim': trial.suggest_categorical('hidden_dim', [32, 64, 96, 128]),
             'out_dim': trial.suggest_categorical('out_dim', [32, 48, 64, 96, 128]),
@@ -644,7 +650,7 @@ def optimize_single_pair(train_loader, val_loader, test_loader,
     
     study = optuna.create_study(
         direction='maximize',
-        sampler=optuna.samplers.RandomSampler(seed=42)
+        sampler=optuna.samplers.RandomSampler(seed=seed)
     )
     
     print(f"\nЗапуск оптимизации...")
@@ -665,6 +671,8 @@ def optimize_single_pair(train_loader, val_loader, test_loader,
     print("\n" + "=" * 80)
     print("ФИНАЛЬНОЕ ОБУЧЕНИЕ С ЛУЧШИМИ ПАРАМЕТРАМИ")
     print("=" * 80)
+    
+    set_seed(seed)
     
     if aggregate_class == ConvMessage:
         msg_list = [
